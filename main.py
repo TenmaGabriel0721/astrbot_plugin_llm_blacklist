@@ -20,13 +20,25 @@ from .blacklist import BanContext, BanRecord, BlacklistStore, scope_target
 PLUGIN_NAME = "astrbot_plugin_llm_blacklist"
 BLOCK_HANDLER_PRIORITY = maxsize + 1
 PAGE_SIZE = 10
+DIRECT_COMMAND_ACTIONS = {
+    "拉黑": "拉黑",
+    "永久拉黑": "永久",
+    "解除拉黑": "解封",
+    "llm拉黑": "拉黑",
+    "llm永久拉黑": "永久",
+    "llm解除拉黑": "解封",
+}
 HELP_TEXT = (
     "下头，拉黑了 · 管理员指令\n"
+    "/拉黑 用户ID [分钟] [原因]\n"
+    "/永久拉黑 用户ID [原因]\n"
+    "/解除拉黑 用户ID\n"
     "/黑名单 列表 [页码]\n"
     "/黑名单 查询 用户ID\n"
     "/黑名单 拉黑 用户ID [分钟] [原因]\n"
     "/黑名单 永久 用户ID [原因]\n"
     "/黑名单 解封 用户ID\n"
+    "也可使用 /llm拉黑、/llm永久拉黑、/llm解除拉黑。\n"
     "临时拉黑省略分钟时使用默认值；填写原因时需同时填写分钟。\n"
     "拉黑范围由 ban_scope 配置决定；解封移除当前会话中对该用户生效的全部记录。"
 )
@@ -375,16 +387,18 @@ class LLMBlacklistPlugin(Star):
             event, user_id, duration_minutes, reason, permanent, "llm"
         )
 
-    @filter.command("黑名单", alias={"llm黑名单"})
     @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
+    @filter.command(
+        "黑名单", alias={"llm黑名单", *DIRECT_COMMAND_ACTIONS}, priority=100
+    )
     async def blacklist_command(
         self, event: AstrMessageEvent, action: str = "列表"
     ) -> AsyncIterator[MessageEventResult]:
-        """查看、查询、临时或永久拉黑、解封用户，仅限 AstrBot 管理员。
+        """查看黑名单，或通过拉黑、永久拉黑、解除拉黑指令管理用户。
 
         Args:
             event: Administrator command event.
-            action: 子操作：列表、查询、拉黑、永久、解封或帮助。
+            action: 黑名单子操作；直接指令根据消息中的指令名称确定操作。
 
         Yields:
             One command response.
@@ -393,11 +407,22 @@ class LLMBlacklistPlugin(Star):
             yield event.plain_result("仅 AstrBot 管理员可以管理黑名单。")
             return
         event.should_call_llm(True)
+        # AstrBot strips the wake prefix before evaluating CommandFilter.
+        tokens = event.get_message_str().strip().split()
+        direct_action = DIRECT_COMMAND_ACTIONS.get(tokens[0]) if tokens else None
+        if direct_action is not None:
+            action = direct_action
+            args = tokens[1:]
+        else:
+            # A direct alias may also match the nested action during SDK parsing.
+            if len(tokens) > 1:
+                action = tokens[1]
+            args = tokens[2:]
         if self.store is None:
             yield event.plain_result("黑名单尚未完成初始化。")
+            if direct_action is not None:
+                event.stop_event()
             return
-        # AstrBot strips the wake prefix before evaluating CommandFilter.
-        args = event.get_message_str().strip().split()[2:]
         identity = self._identity(event)
         try:
             if action == "列表":
@@ -448,9 +473,7 @@ class LLMBlacklistPlugin(Star):
                     duration = self._parse_minutes(args[1])
                     reason_start = 2
                     if duration <= 0:
-                        raise ValueError(
-                            "临时拉黑时长必须大于 0；解封请用 /黑名单 解封。"
-                        )
+                        raise ValueError("临时拉黑时长必须大于 0；解封请用 /解除拉黑。")
                 result = await self._manage_blacklist(
                     event,
                     args[0],
@@ -464,3 +487,6 @@ class LLMBlacklistPlugin(Star):
         except ValueError as error:
             result = f"操作失败：{error}"
         yield event.plain_result(result)
+        if direct_action is not None:
+            # Send the response before stopping competing command handlers.
+            event.stop_event()

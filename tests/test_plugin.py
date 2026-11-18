@@ -1,17 +1,21 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 from astrbot.api.event import MessageEventResult
 from astrbot.core.pipeline.process_stage.method.star_request import StarRequestSubStage
+from astrbot.core.pipeline.scheduler import PipelineScheduler
 from astrbot.core.provider.register import llm_tools
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
+from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
 from astrbot.core.star.star import StarMetadata, star_map
 from astrbot.core.star.star_handler import (
     EventType,
     StarHandlerMetadata,
+    StarHandlerRegistry,
     star_handlers_registry,
 )
 from astrbot_plugin_llm_blacklist import main as plugin_module
@@ -114,6 +118,30 @@ def identity(event):
         group_id=event.get_group_id(),
         session_id=event.unified_msg_origin,
     )
+
+
+async def invoke_blacklist_command(plugin, event, metadata):
+    command_filter = next(
+        event_filter
+        for event_filter in metadata.event_filters
+        if isinstance(event_filter, CommandFilter)
+    )
+    assert command_filter.filter(event, {})
+    return [
+        result
+        async for result in plugin.blacklist_command(
+            event, **event.get_extra("parsed_params")
+        )
+    ]
+
+
+@pytest.fixture
+def command_metadata():
+    metadata = star_handlers_registry.get_handler_by_full_name(
+        f"{plugin_module.__name__}_blacklist_command"
+    )
+    assert metadata is not None
+    return metadata
 
 
 @pytest.fixture
@@ -443,67 +471,315 @@ def test_real_sdk_tool_schema_exposes_permanent_boolean():
     assert "duration_minutes" in tool.parameters["properties"]
 
 
+def test_admin_command_aliases_keep_native_permission_and_priority(command_metadata):
+    command_filters = [
+        event_filter
+        for event_filter in command_metadata.event_filters
+        if isinstance(event_filter, CommandFilter)
+    ]
+    assert len(command_filters) == 1
+    assert command_filters[0].command_name == "黑名单"
+    assert command_filters[0].alias >= {
+        "llm黑名单",
+        "拉黑",
+        "永久拉黑",
+        "解除拉黑",
+        "llm拉黑",
+        "llm永久拉黑",
+        "llm解除拉黑",
+    }
+    assert command_metadata.extras_configs["priority"] == 100
+    permission_filter = next(
+        event_filter
+        for event_filter in command_metadata.event_filters
+        if isinstance(event_filter, PermissionTypeFilter)
+    )
+    assert permission_filter.permission_type == PermissionType.ADMIN
+    assert permission_filter.raise_error is False
+
+
 @pytest.mark.asyncio
-async def test_nonadmin_cannot_manage_blacklist_even_if_handler_called_directly(plugin):
-    event = FakeEvent(message="黑名单 永久 target repeated harassment")
+@pytest.mark.parametrize(
+    ("message", "minutes", "reason"),
+    [
+        ("拉黑 openid-target", 10, "管理员操作"),
+        ("拉黑\topenid-target 25  repeated\n harassment", 25, "repeated harassment"),
+        ("llm拉黑 openid-target", 10, "管理员操作"),
+        (
+            "llm拉黑 openid-target 100000 repeated harassment",
+            1440,
+            "repeated harassment",
+        ),
+    ],
+)
+async def test_direct_temporary_commands_parse_target_duration_and_reason(
+    plugin, command_metadata, message, minutes, reason
+):
+    event = FakeEvent(user_id="owner", admin=True, message=message)
 
-    results = [result async for result in plugin.blacklist_command(event, "永久")]
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
 
+    # The native SDK puts the target in action; the handler must recover the
+    # intended operation from the command token before consuming arguments.
+    assert event.get_extra("parsed_params") == {"action": "openid-target"}
+    record = plugin.store.get_active("openid-target", identity(event))
+    assert record is not None
+    assert record.expires_at == CLOCK + minutes * 60
+    assert record.reason == reason
+    assert record.source == "admin"
+    assert record.operator == "owner"
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+    assert event.call_llm
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["黑名单", "llm黑名单"])
+async def test_nested_temporary_commands_keep_their_argument_offsets(
+    plugin, command_metadata, command
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} 拉黑 target 25 repeated harassment",
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("target", identity(event))
+    assert record is not None
+    assert record.expires_at == CLOCK + 25 * 60
+    assert record.reason == "repeated harassment"
     assert results
-    assert plugin.store.get_active("target", identity(event)) is None
+    assert not event.stopped
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "拉黑 new-target 25 unauthorized action",
+        "永久拉黑 new-target unauthorized action",
+        "解除拉黑 target",
+        "llm拉黑 new-target 25 unauthorized action",
+        "llm永久拉黑 new-target unauthorized action",
+        "llm解除拉黑 target",
+        "黑名单 永久 new-target unauthorized action",
+    ],
+)
+async def test_nonadmin_cannot_manage_blacklist_even_if_handler_called_directly(
+    plugin, command_metadata, message
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    before = plugin.store.path.read_bytes()
+    event = FakeEvent(message=message)
+    permission_filter = next(
+        event_filter
+        for event_filter in command_metadata.event_filters
+        if isinstance(event_filter, PermissionTypeFilter)
+    )
+    assert not permission_filter.filter(event, {})
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "仅 AstrBot 管理员" in results[0].get_plain_text()
+    assert plugin.store.get_active("new-target", identity(event)) is None
+    assert plugin.store.get_active("target", identity(event)).expires_at is None
+    assert plugin.store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    ["黑名单 永久", "llm黑名单 永久", "永久拉黑", "llm永久拉黑"],
+)
 async def test_admin_permanent_command_is_independent_of_llm_permanent_gate(
-    plugin_factory,
+    plugin_factory, command_metadata, command
 ):
     plugin = await plugin_factory(allow_llm_permanent_ban=False)
     event = FakeEvent(
-        user_id="owner", admin=True, message="黑名单 永久 target repeated harassment"
+        user_id="owner", admin=True, message=f"{command} target repeated harassment"
     )
-    metadata = star_handlers_registry.get_handler_by_full_name(
-        f"{plugin_module.__name__}_blacklist_command"
-    )
-    command_filter = next(
-        event_filter
-        for event_filter in metadata.event_filters
-        if isinstance(event_filter, CommandFilter)
-    )
-    assert command_filter.filter(event, {})
 
-    results = [
-        result
-        async for result in plugin.blacklist_command(
-            event, **event.get_extra("parsed_params")
-        )
-    ]
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
 
     record = plugin.store.get_active("target", identity(event))
     assert results
     assert record is not None
     assert record.expires_at is None
     assert record.reason == "repeated harassment"
+    assert record.source == "admin"
+    assert event.call_llm
+    if command in {"永久拉黑", "llm永久拉黑"}:
+        assert event.stopped
 
 
 @pytest.mark.asyncio
-async def test_admin_can_explicitly_unban_permanent_record(plugin):
+@pytest.mark.parametrize(
+    "command",
+    ["黑名单 解封", "llm黑名单 解封", "解除拉黑", "llm解除拉黑"],
+)
+async def test_admin_can_explicitly_unban_permanent_record(
+    plugin, command_metadata, command
+):
     await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
-    event = FakeEvent(user_id="owner", admin=True, message="黑名单 解封 target")
+    event = FakeEvent(user_id="owner", admin=True, message=f"{command} target")
 
-    results = [result async for result in plugin.blacklist_command(event, "解封")]
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
 
-    assert results
+    assert "已解除用户 target" in results[0].get_plain_text()
     assert plugin.store.get_active("target", identity(event)) is None
+    assert event.call_llm
+    if command in {"解除拉黑", "llm解除拉黑"}:
+        assert event.stopped
 
 
 @pytest.mark.asyncio
-async def test_invalid_admin_command_does_not_mutate_blacklist(plugin):
-    event = FakeEvent(user_id="owner", admin=True, message="黑名单 拉黑 target nope")
+@pytest.mark.parametrize(
+    "message",
+    [
+        "黑名单 拉黑 target nope",
+        "拉黑",
+        "永久拉黑",
+        "解除拉黑",
+        "拉黑 target nope",
+        "拉黑 target 0",
+        "拉黑 target -1",
+        "拉黑 target 1.5",
+        "解除拉黑 target extra",
+        "llm拉黑 target nope",
+        "llm解除拉黑 target extra",
+    ],
+)
+async def test_invalid_admin_command_does_not_mutate_blacklist(
+    plugin, command_metadata, message
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "existing-target", permanent=True)
+    before = plugin.store.path.read_bytes()
+    event = FakeEvent(user_id="owner", admin=True, message=message)
 
-    results = [result async for result in plugin.blacklist_command(event, "拉黑")]
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
 
-    assert results
+    assert "操作失败" in results[0].get_plain_text()
     assert plugin.store.get_active("target", identity(event)) is None
+    assert plugin.store.path.read_bytes() == before
+    assert event.call_llm
+    if not message.startswith("黑名单 "):
+        assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "target"),
+    [
+        ("拉黑 bot-A 25", "bot-A"),
+        ("永久拉黑 owner repeated harassment", "owner"),
+        ("llm永久拉黑 protected repeated harassment", "protected"),
+    ],
+)
+async def test_direct_commands_preserve_protected_user_policy(
+    plugin_factory, command_metadata, message, target
+):
+    plugin = await plugin_factory(protected_user_ids=["protected"])
+    event = FakeEvent(user_id="owner", admin=True, message=message)
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "不能拉黑" in results[0].get_plain_text()
+    assert plugin.store.get_active(target, identity(event)) is None
+    assert event.call_llm
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+async def test_uninitialized_direct_command_still_stops_propagation(
+    plugin, command_metadata
+):
+    plugin.store = None
+    event = FakeEvent(user_id="owner", admin=True, message="拉黑 target 25")
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "尚未完成初始化" in results[0].get_plain_text()
+    assert event.call_llm
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration", ["25", "invalid"])
+async def test_direct_command_priority_and_stop_prevent_competing_sdk_handler(
+    plugin, command_metadata, monkeypatch, duration
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"拉黑 target {duration} repeated harassment",
+    )
+    calls = []
+
+    async def competing_command(current_event):
+        calls.append("competing")
+
+    module_name = "test_blacklist_command_collision"
+    competing = StarHandlerMetadata(
+        event_type=EventType.AdapterMessageEvent,
+        handler_full_name=f"{module_name}_competing_command",
+        handler_name="competing_command",
+        handler_module_path=module_name,
+        handler=competing_command,
+        event_filters=[],
+    )
+    competing.event_filters.append(CommandFilter("拉黑", handler_md=competing))
+    command = replace(command_metadata, handler=plugin.blacklist_command)
+    registry = StarHandlerRegistry()
+    # Register the competing command first so order depends on SDK priority.
+    registry.append(competing)
+    registry.append(command)
+    monkeypatch.setitem(star_map, module_name, StarMetadata(name="competing-command"))
+    monkeypatch.setitem(
+        star_map, command.handler_module_path, StarMetadata(name="blacklist-command")
+    )
+    activated = []
+    parsed = {}
+    for handler in registry.get_handlers_by_event_type(EventType.AdapterMessageEvent):
+        if all(
+            event_filter.filter(event, {}) for event_filter in handler.event_filters
+        ):
+            activated.append(handler)
+            parsed[handler.handler_full_name] = dict(event.get_extra("parsed_params"))
+    assert activated == [command, competing]
+    event.set_extra("activated_handlers", activated)
+    event.set_extra("handlers_parsed_params", parsed)
+
+    responses = []
+
+    async def handler_stage(current_event):
+        async for result in StarRequestSubStage().process(current_event):
+            yield result
+
+    async def send_spy(current_event):
+        if not current_event.is_stopped() and current_event.get_result() is not None:
+            responses.append(current_event.get_result().get_plain_text())
+
+    scheduler = PipelineScheduler.__new__(PipelineScheduler)
+    scheduler.stages = [
+        SimpleNamespace(process=handler_stage),
+        SimpleNamespace(process=send_spy),
+    ]
+    await scheduler._process_stages(event)
+
+    assert calls == []
+    assert len(responses) == 1
+    record = plugin.store.get_active("target", identity(event))
+    if duration == "25":
+        assert "已保存拉黑记录" in responses[0]
+        assert record is not None
+        assert record.expires_at == CLOCK + 25 * 60
+    else:
+        assert "操作失败" in responses[0]
+        assert record is None
+    assert event.call_llm
+    assert event.stopped
 
 
 @pytest.mark.asyncio
