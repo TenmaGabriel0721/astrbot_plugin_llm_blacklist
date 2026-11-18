@@ -1,0 +1,39 @@
+{
+  "default_blacklist_duration": {
+    "description": "默认临时拉黑时长（分钟）",
+    "type": "int",
+    "hint": "必须大于 0。LLM 未指定时长或传入负数时使用此值；超过最大时长时取最大值。",
+    "default": 10
+  },
+  "max_blacklist_duration": {
+    "description": "单次临时拉黑最大时长（分钟）",
+    "type": "int",
+    "hint": "必须大于 0。适用于 LLM 和管理员创建的临时记录；不会缩短已有记录，也不限制永久拉黑。",
+    "default": 1440
+  },
+  "ban_scope": {
+    "description": "新建拉黑记录的范围",
+    "type": "string",
+    "hint": "global：当前平台实例、当前 Bot 的全部会话；group：当前群聊，私聊时按当前会话；session：当前会话来源。修改配置后，已有记录仍按原范围生效。",
+    "default": "global",
+    "options": ["global", "group", "session"]
+  },
+  "strict_block_mode": {
+    "description": "严格屏蔽后续消息处理器",
+    "type": "bool",
+    "hint": "开启时终止被拉黑发送者的后续消息处理器和 LLM 请求。关闭时阻止标准指令和经过 AstrBot 钩子的 LLM 请求，普通监听器仍可处理消息。",
+    "default": true
+  },
+  "allow_llm_permanent_ban": {
+    "description": "允许 LLM 永久拉黑",
+    "type": "bool",
+    "hint": "允许 LLM 在工具中明确设置 permanent=true。关闭后管理员仍能通过指令永久拉黑；已有永久记录继续生效。",
+    "default": true
+  },
+  "protected_user_ids": {
+    "description": "受保护用户 ID",
+    "type": "list",
+    "hint": "这些用户不能被新拉黑，已有记录也不拦截其消息。支持数字 ID 和 OpenID。AstrBot 管理员与 Bot 自身始终受到保护。",
+    "default": []
+  }
+}

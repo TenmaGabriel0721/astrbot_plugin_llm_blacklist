@@ -1,0 +1,563 @@
+import json
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+from astrbot.api.event import MessageEventResult
+from astrbot.core.pipeline.process_stage.method.star_request import StarRequestSubStage
+from astrbot.core.provider.register import llm_tools
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
+from astrbot.core.star.star import StarMetadata, star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    star_handlers_registry,
+)
+from astrbot_plugin_llm_blacklist import main as plugin_module
+from astrbot_plugin_llm_blacklist.blacklist import BanContext, BanRecord
+from astrbot_plugin_llm_blacklist.main import LLMBlacklistPlugin
+
+CLOCK = 1_000_000.0
+
+
+class FakeEvent:
+    """Represent the public event API without connecting to a platform."""
+
+    def __init__(
+        self,
+        user_id="actor",
+        group_id="group-A",
+        platform_id="platform-A",
+        bot_id="bot-A",
+        session_id=None,
+        admin=False,
+        message="黑名单",
+    ):
+        self.message_obj = SimpleNamespace(
+            sender=SimpleNamespace(user_id=user_id),
+            self_id=bot_id,
+            group_id=group_id,
+            message=[],
+        )
+        self.unified_msg_origin = session_id or (
+            f"{platform_id}:GroupMessage:{group_id}"
+            if group_id
+            else f"{platform_id}:FriendMessage:{user_id}"
+        )
+        self._group_id = group_id
+        self._platform_id = platform_id
+        self._bot_id = bot_id
+        self._admin = admin
+        self.message_str = message
+        self._extras = {}
+        self._result = None
+        self.call_llm = False
+        self.stopped = False
+        self.is_at_or_wake_command = True
+        self.trace = SimpleNamespace(record=lambda *args, **kwargs: None)
+
+    def get_sender_id(self):
+        return self.message_obj.sender.user_id
+
+    def get_group_id(self):
+        return self._group_id
+
+    def get_platform_id(self):
+        return self._platform_id
+
+    def get_self_id(self):
+        return self._bot_id
+
+    def get_message_str(self):
+        return self.message_str
+
+    def get_messages(self):
+        return self.message_obj.message
+
+    def is_admin(self):
+        return self._admin
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def should_call_llm(self, prohibited):
+        self.call_llm = prohibited
+
+    def stop_event(self):
+        self.stopped = True
+        self._result = MessageEventResult().stop_event()
+
+    def is_stopped(self):
+        return self.stopped
+
+    def get_result(self):
+        return self._result
+
+    def set_result(self, result):
+        self._result = result
+
+    def clear_result(self):
+        self._result = None
+
+    def plain_result(self, text):
+        return MessageEventResult().message(text)
+
+
+def identity(event):
+    return BanContext(
+        platform_id=event.get_platform_id(),
+        bot_id=event.get_self_id(),
+        group_id=event.get_group_id(),
+        session_id=event.unified_msg_origin,
+    )
+
+
+@pytest.fixture
+def plugin_factory(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_module.time, "time", lambda: CLOCK)
+
+    def data_directory(name):
+        path = tmp_path / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    monkeypatch.setattr(plugin_module.StarTools, "get_data_dir", data_directory)
+
+    async def create(**overrides):
+        config = {
+            "default_blacklist_duration": 10,
+            "max_blacklist_duration": 1440,
+            "ban_scope": "global",
+            "strict_block_mode": True,
+            "allow_llm_permanent_ban": True,
+            "protected_user_ids": [],
+        }
+        config.update(overrides)
+        context = SimpleNamespace(get_config=lambda umo=None: {"admins_id": ["owner"]})
+        plugin = LLMBlacklistPlugin(context, config)
+        await plugin.initialize()
+        return plugin
+
+    return create
+
+
+@pytest_asyncio.fixture
+async def plugin(plugin_factory):
+    return await plugin_factory()
+
+
+@pytest.mark.asyncio
+async def test_permanent_ban_survives_restart_and_elapsed_time(
+    plugin, plugin_factory, monkeypatch
+):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(event, "openid-target", permanent=True)
+
+    record = plugin.store.get_active("openid-target", identity(event))
+    assert record is not None
+    assert record.expires_at is None
+
+    monkeypatch.setattr(plugin_module.time, "time", lambda: CLOCK + 50 * 365 * 86400)
+    restarted = await plugin_factory()
+    assert (
+        restarted.store.get_active("openid-target", identity(event)).expires_at is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_duration_and_maximum_are_enforced(plugin):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(event, "default-target")
+    await plugin.llm_blacklist_manage(event, "capped-target", duration_minutes=100_000)
+
+    assert plugin.store.get_active("default-target", identity(event)).expires_at == (
+        CLOCK + 10 * 60
+    )
+    assert plugin.store.get_active("capped-target", identity(event)).expires_at == (
+        CLOCK + 1440 * 60
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_duration_explicitly_removes_permanent_ban(plugin):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(event, "target", permanent=True)
+
+    await plugin.llm_blacklist_manage(event, "target", duration_minutes=0)
+
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+async def test_shorter_repeat_keeps_existing_temporary_expiry(plugin):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(event, "target", duration_minutes=60)
+
+    await plugin.llm_blacklist_manage(event, "target", duration_minutes=5)
+
+    assert plugin.store.get_active("target", identity(event)).expires_at == CLOCK + 3600
+
+
+@pytest.mark.asyncio
+async def test_temporary_repeat_cannot_downgrade_permanent_ban(plugin):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(event, "target", permanent=True)
+
+    await plugin.llm_blacklist_manage(event, "target", duration_minutes=5)
+
+    assert plugin.store.get_active("target", identity(event)).expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_and_unban_parameters_conflict(plugin):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(
+        event, "target", duration_minutes=0, permanent=True
+    )
+
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+async def test_llm_permanent_ban_can_be_disabled(plugin_factory):
+    plugin = await plugin_factory(allow_llm_permanent_ban=False)
+    event = FakeEvent()
+
+    await plugin.llm_blacklist_manage(event, "target", permanent=True)
+
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["bot-A", "owner", "protected"])
+async def test_bot_admin_and_configured_users_are_protected(plugin_factory, target):
+    plugin = await plugin_factory(protected_user_ids=["protected"])
+    event = FakeEvent()
+
+    await plugin.llm_blacklist_manage(event, target, permanent=True)
+
+    assert plugin.store.get_active(target, identity(event)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "duration", [True, 1.5, float("nan"), float("inf"), "oops", None]
+)
+async def test_invalid_duration_does_not_mutate_blacklist(plugin, duration):
+    event = FakeEvent()
+
+    result = await plugin.llm_blacklist_manage(
+        event, "target", duration_minutes=duration
+    )
+
+    assert isinstance(result, str)
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+async def test_global_scope_is_separate_for_each_bot_and_platform(plugin):
+    actor = FakeEvent()
+    await plugin.llm_blacklist_manage(actor, "target", permanent=True)
+    matching = FakeEvent(user_id="target", group_id="another-group")
+    another_bot = FakeEvent(user_id="target", bot_id="bot-B")
+    another_platform = FakeEvent(user_id="target", platform_id="platform-B")
+
+    await plugin.block_blacklisted_messages(matching)
+    await plugin.block_blacklisted_messages(another_bot)
+    await plugin.block_blacklisted_messages(another_platform)
+
+    assert matching.stopped
+    assert not another_bot.stopped
+    assert not another_platform.stopped
+
+
+@pytest.mark.asyncio
+async def test_changing_creation_scope_does_not_disable_existing_group_ban(
+    plugin_factory,
+):
+    plugin = await plugin_factory(ban_scope="group")
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    plugin = await plugin_factory(ban_scope="session")
+    matching = FakeEvent(user_id="target")
+    unrelated = FakeEvent(user_id="target", group_id="group-B")
+
+    await plugin.block_blacklisted_messages(matching)
+    await plugin.block_blacklisted_messages(unrelated)
+
+    assert matching.stopped
+    assert not unrelated.stopped
+
+
+@pytest.mark.asyncio
+async def test_session_scope_distinguishes_branches_of_same_group(plugin_factory):
+    plugin = await plugin_factory(ban_scope="session")
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    matching = FakeEvent(user_id="target")
+    unrelated = FakeEvent(
+        user_id="target", session_id="platform-A:GroupMessage:group-A-branch"
+    )
+
+    await plugin.block_blacklisted_messages(matching)
+    await plugin.block_blacklisted_messages(unrelated)
+
+    assert matching.stopped
+    assert not unrelated.stopped
+
+
+@pytest.mark.asyncio
+async def test_expired_temporary_ban_does_not_block_message(plugin, monkeypatch):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", duration_minutes=1)
+    monkeypatch.setattr(plugin_module.time, "time", lambda: CLOCK + 60)
+    event = FakeEvent(user_id="target")
+
+    await plugin.block_blacklisted_messages(event)
+
+    assert not event.stopped
+    assert not event.call_llm
+
+
+@pytest.mark.asyncio
+async def test_nonstrict_mode_blocks_commands_and_llm_but_keeps_listeners(
+    plugin_factory,
+):
+    plugin = await plugin_factory(strict_block_mode=False)
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    event = FakeEvent(user_id="target")
+    command = SimpleNamespace(event_filters=[CommandFilter("测试")])
+    command_group = SimpleNamespace(event_filters=[CommandGroupFilter("管理")])
+    listener = SimpleNamespace(event_filters=[object()])
+    handlers = [command, listener, command_group]
+    event.set_extra("activated_handlers", handlers)
+
+    await plugin.block_blacklisted_messages(event)
+
+    assert handlers == [listener]
+    assert event.call_llm
+    assert not event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", ["block_waiting_llm", "block_llm_request"])
+async def test_llm_hooks_stop_blacklisted_request(plugin, hook):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    event = FakeEvent(user_id="target")
+
+    arguments = (event, SimpleNamespace()) if hook == "block_llm_request" else (event,)
+    await getattr(plugin, hook)(*arguments)
+
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+async def test_administrator_remains_able_to_recover_after_becoming_protected(plugin):
+    event = FakeEvent(user_id="owner", admin=True)
+    plugin.store.ban(
+        BanRecord(
+            user_id="owner",
+            platform_id="platform-A",
+            bot_id="bot-A",
+            scope="global",
+            scope_id="",
+            reason="Legacy entry",
+            created_at=CLOCK,
+            expires_at=None,
+            operator="legacy",
+            source="legacy",
+        )
+    )
+
+    await plugin.block_blacklisted_messages(event)
+    await plugin.block_waiting_llm(event)
+    await plugin.block_llm_request(event, SimpleNamespace())
+
+    assert not event.stopped
+    assert not event.call_llm
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_stops_later_handlers_in_actual_sdk_pipeline(plugin):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    event = FakeEvent(user_id="target")
+    calls = []
+
+    async def blocker(current_event):
+        calls.append("blocker")
+        await plugin.block_blacklisted_messages(current_event)
+
+    async def listener(current_event):
+        calls.append("listener")
+
+    module_name = "test_blacklist_pipeline"
+    star_map[module_name] = StarMetadata(name="blacklist-pipeline-test")
+    event.set_extra(
+        "activated_handlers",
+        [
+            StarHandlerMetadata(
+                event_type=EventType.AdapterMessageEvent,
+                handler_full_name=f"{module_name}_{handler.__name__}",
+                handler_name=handler.__name__,
+                handler_module_path=module_name,
+                handler=handler,
+                event_filters=[],
+            )
+            for handler in [blocker, listener]
+        ],
+    )
+    event.set_extra("handlers_parsed_params", {})
+
+    try:
+        async for _ in StarRequestSubStage().process(event):
+            pass
+    finally:
+        star_map.pop(module_name, None)
+
+    assert calls == ["blocker"]
+    assert event.call_llm
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_old_data_without_modifying_source(
+    plugin_factory, tmp_path
+):
+    legacy_path = tmp_path / "astrbot_plugin_llmtempban" / "blacklist.json"
+    legacy_path.parent.mkdir(parents=True)
+    original = json.dumps({"legacy-target": CLOCK + 600})
+    legacy_path.write_text(original, encoding="utf-8")
+
+    plugin = await plugin_factory()
+
+    assert plugin.store.get_active("legacy-target", identity(FakeEvent())) is not None
+    assert legacy_path.read_text(encoding="utf-8") == original
+
+
+def test_real_sdk_tool_schema_exposes_permanent_boolean():
+    tool = llm_tools.get_func("llm_blacklist_manage")
+
+    assert tool is not None
+    assert tool.parameters["properties"]["permanent"]["type"] == "boolean"
+    assert "duration_minutes" in tool.parameters["properties"]
+
+
+@pytest.mark.asyncio
+async def test_nonadmin_cannot_manage_blacklist_even_if_handler_called_directly(plugin):
+    event = FakeEvent(message="黑名单 永久 target repeated harassment")
+
+    results = [result async for result in plugin.blacklist_command(event, "永久")]
+
+    assert results
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+async def test_admin_permanent_command_is_independent_of_llm_permanent_gate(
+    plugin_factory,
+):
+    plugin = await plugin_factory(allow_llm_permanent_ban=False)
+    event = FakeEvent(
+        user_id="owner", admin=True, message="黑名单 永久 target repeated harassment"
+    )
+    metadata = star_handlers_registry.get_handler_by_full_name(
+        f"{plugin_module.__name__}_blacklist_command"
+    )
+    command_filter = next(
+        event_filter
+        for event_filter in metadata.event_filters
+        if isinstance(event_filter, CommandFilter)
+    )
+    assert command_filter.filter(event, {})
+
+    results = [
+        result
+        async for result in plugin.blacklist_command(
+            event, **event.get_extra("parsed_params")
+        )
+    ]
+
+    record = plugin.store.get_active("target", identity(event))
+    assert results
+    assert record is not None
+    assert record.expires_at is None
+    assert record.reason == "repeated harassment"
+
+
+@pytest.mark.asyncio
+async def test_admin_can_explicitly_unban_permanent_record(plugin):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    event = FakeEvent(user_id="owner", admin=True, message="黑名单 解封 target")
+
+    results = [result async for result in plugin.blacklist_command(event, "解封")]
+
+    assert results
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_admin_command_does_not_mutate_blacklist(plugin):
+    event = FakeEvent(user_id="owner", admin=True, message="黑名单 拉黑 target nope")
+
+    results = [result async for result in plugin.blacklist_command(event, "拉黑")]
+
+    assert results
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+@pytest.mark.asyncio
+async def test_storage_failure_does_not_report_success_or_mutate_state(
+    plugin, monkeypatch
+):
+    event = FakeEvent()
+
+    def fail_to_save(record):
+        raise OSError("Simulated disk failure")
+
+    monkeypatch.setattr(plugin.store, "ban", fail_to_save)
+
+    result = await plugin.llm_blacklist_manage(event, "target", permanent=True)
+
+    assert isinstance(result, str)
+    assert "失败" in result
+    assert plugin.store.get_active("target", identity(event)) is None
+
+
+def test_far_future_legacy_expiry_can_be_displayed():
+    record = BanRecord(
+        user_id="legacy-target",
+        platform_id="",
+        bot_id="",
+        scope="global",
+        scope_id="",
+        reason="Legacy far-future expiry",
+        created_at=CLOCK,
+        expires_at=1e30,
+        operator="legacy",
+        source="legacy",
+    )
+
+    result = LLMBlacklistPlugin._describe_record(record)
+
+    assert "legacy-target" in result
+    assert "远期" in result
+
+
+@pytest.mark.asyncio
+async def test_blacklisted_requester_cannot_unban_itself_in_followup_tool_call(plugin):
+    event = FakeEvent()
+    await plugin.llm_blacklist_manage(event, "actor", permanent=True)
+
+    await plugin.llm_blacklist_manage(event, "actor", duration_minutes=0)
+
+    assert plugin.store.get_active("actor", identity(event)).expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_string_false_cannot_accidentally_enable_permanent_ban(plugin):
+    event = FakeEvent()
+
+    await plugin.llm_blacklist_manage(event, "target", permanent="false")
+
+    assert plugin.store.get_active("target", identity(event)) is None

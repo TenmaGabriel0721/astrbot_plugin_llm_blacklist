@@ -1,0 +1,9 @@
+下头，拉黑了 (astrbot_plugin_llm_blacklist)
+Copyright (C) 2026 TenmaGabriel0721
+
+This project rewrites and extends the behavior of astrbot_plugin_LLMTempBan
+by 长安某 / zgojin, including the locally maintained v2.6.0 variant.
+Original project: https://github.com/zgojin/astrbot_plugin_LLMTempBan
+
+The original project and this derivative are licensed under GNU AGPL v3.0.
+The original license is retained in LICENSE.

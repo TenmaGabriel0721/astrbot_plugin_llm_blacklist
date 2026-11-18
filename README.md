@@ -1,0 +1,146 @@
+# 下头，拉黑了
+
+AstrBot 黑名单插件，支持 LLM 自主临时拉黑、永久拉黑，以及管理员查询和解封。作者：[TenmaGabriel0721](https://github.com/TenmaGabriel0721)。
+
+封禁记录持久化保存；临时拉黑到期失效，永久拉黑需要明确解封。支持数字用户 ID、QQ 官方 OpenID 等平台标识，并按平台实例与 Bot 隔离新建记录。
+
+本插件控制 Bot 对用户的交互响应。聊天平台的群禁言功能请使用群管理插件。
+
+## 安装与升级
+
+要求 AstrBot `>=4.16,<5`，Python `>=3.10`。插件没有额外运行时依赖。
+
+在 AstrBot 管理面板中通过仓库链接安装：
+
+```text
+https://github.com/TenmaGabriel0721/astrbot_plugin_llm_blacklist
+```
+
+如果正在使用 `astrbot_plugin_llmtempban`：
+
+1. 先停用旧插件，并保留其 `data/plugin_data/astrbot_plugin_llmtempban/blacklist.json`。
+2. 安装并启用本插件。两个插件使用相同的 `llm_blacklist_manage` 工具名，避免同时启用。
+3. 手动将需要保留的旧插件配置填入本插件配置页面；首次加载会自动迁移有效黑名单记录。
+
+使用会话配置或插件白名单时，确认相应 `plugin_set` 包含 `astrbot_plugin_llm_blacklist`。如需 LLM 自主处理，在该会话使用的人格中启用 `llm_blacklist_manage` 工具。
+
+## 管理员指令
+
+以下指令仅限 **AstrBot 管理员**。QQ 群管理员身份本身不授予管理权限。`/llm黑名单` 是 `/黑名单` 的别名。
+
+| 指令 | 用途 |
+| --- | --- |
+| `/黑名单` 或 `/黑名单 列表 [页码]` | 查看当前 Bot 的有效记录，每页 10 条，永久记录优先 |
+| `/黑名单 查询 用户ID` | 查看目标在当前会话生效的封禁 |
+| `/黑名单 拉黑 用户ID [分钟] [原因]` | 创建临时拉黑 |
+| `/黑名单 永久 用户ID [原因]` | 创建永久拉黑 |
+| `/黑名单 解封 用户ID` | 删除目标在当前会话生效的全部封禁记录 |
+| `/黑名单 帮助` | 查看指令格式 |
+
+例如：
+
+```text
+/黑名单 拉黑 123456789 30 持续刷屏
+/黑名单 永久 openid-example 持续恶意骚扰
+/黑名单 查询 123456789
+/黑名单 解封 123456789
+```
+
+临时时长必须为正整数分钟。省略时长时使用配置默认值；需要填写原因时，请同时填写分钟数。原因可以包含空格。
+
+列表包含当前 Bot 在不同群聊、会话中的有效记录；查询只显示当前会话对该用户生效的最强记录，优先永久记录，其次是到期时间最晚的临时记录。
+
+解封会删除当前会话对目标生效的全部记录，包括覆盖本会话的全局记录。其他群聊或会话的局部封禁保留；删除全局记录会同时解除该记录覆盖的其他会话。
+
+## LLM 工具
+
+工具名：`llm_blacklist_manage`。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `user_id` | 必填 | 目标用户的实际平台 ID |
+| `duration_minutes` | `-1` | 整数分钟；负数或省略使用默认时长，`0` 表示解封 |
+| `reason` | `行为不当` | 拉黑原因 |
+| `permanent` | `false` | `true` 表示永久拉黑 |
+
+临时拉黑：
+
+```json
+{"user_id": "123456789", "duration_minutes": 30, "reason": "持续刷屏"}
+```
+
+永久拉黑：
+
+```json
+{"user_id": "openid-example", "permanent": true, "reason": "持续恶意骚扰"}
+```
+
+解封：
+
+```json
+{"user_id": "123456789", "duration_minutes": 0, "permanent": false}
+```
+
+`permanent=true` 与 `duration_minutes=0` 同时提交会报错。临时拉黑受最大时长限制；同一范围重复拉黑不会缩短已有期限，也不会将永久记录降为临时记录。工具会返回实际生效的封禁信息。
+
+LLM 可以根据对话行为自主决定拉黑或解封。关闭 `allow_llm_permanent_ban` 后，LLM 无法新建永久记录，管理员仍可使用永久拉黑指令，已有永久记录继续生效。
+
+## 配置
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `default_blacklist_duration` | `10` | 默认临时时长，正整数分钟；超过最大值时取最大值 |
+| `max_blacklist_duration` | `1440` | 单次临时拉黑上限，正整数分钟；同时约束管理员和 LLM |
+| `ban_scope` | `global` | 新建记录的范围，见下表 |
+| `strict_block_mode` | `true` | 是否终止被拉黑发送者的后续消息处理器 |
+| `allow_llm_permanent_ban` | `true` | 是否允许 LLM 明确创建永久拉黑 |
+| `protected_user_ids` | `[]` | 不能被新拉黑、已有记录也不拦截的用户 ID 列表 |
+
+| `ban_scope` | 新建记录覆盖范围 |
+| --- | --- |
+| `global` | 当前平台适配器实例、当前 Bot 的全部会话 |
+| `group` | 当前群聊；私聊时按当前会话处理 |
+| `session` | 当前会话来源，即 AstrBot 的 `unified_msg_origin` |
+
+修改 `ban_scope` 只影响之后创建的记录，已有记录继续按保存时的范围生效。单次时长上限不会缩短已有记录，也不限制永久拉黑。
+
+AstrBot 管理员、Bot 自身和 `protected_user_ids` 中的用户受到保护，无法被新拉黑。管理员消息和受保护用户消息也不会因已有记录被拦截，以便管理员始终能查询或解封。受保护用户的已有记录仍会保留、显示。
+
+严格模式会停止被拉黑用户的后续消息处理器，并拦截经过 AstrBot 钩子的 LLM 请求。关闭严格模式时，阻止标准指令和这些 LLM 请求，普通监听器仍可处理消息。
+
+上述拦截作用于插件执行后的消息处理链。AstrBot 提前解析指令时产生的参数错误或权限提示、已有等待会话的回调，以及其他插件直接调用平台接口的主动消息，可能发生在该拦截范围之外。
+
+## 数据与迁移
+
+新数据保存在 AstrBot 数据目录下：
+
+```text
+data/plugin_data/astrbot_plugin_llm_blacklist/blacklist.json
+```
+
+记录包含用户、平台实例、Bot、范围、原因、创建时间、到期时间和操作来源。永久记录的 `expires_at` 为 `null`。重载插件或重启 AstrBot 后仍会保留有效记录；过期记录不再拦截消息，并在后续写入时清理。
+
+首次加载且新数据库不存在时，自动读取旧插件的 `blacklist.json`，支持旧版用户 ID → 到期时间格式和带范围的记录格式。迁移完成后创建新数据库，后续加载使用新数据库，不会重复导入。旧文件原样保留，旧配置需要手动转移。
+
+旧记录缺少平台实例、Bot 身份，因此保持原范围：**旧版全局记录仍覆盖全部 Bot**，并在列表中注明。旧版群聊和会话记录保留其原范围；旧版全局记录被解封时，其覆盖的全部 Bot 同时解除该记录。
+
+数据库格式损坏或记录无效时会明确报错，停止加载，避免以空黑名单覆盖原文件。保存采用原子替换，并发操作串行提交；保存失败时保留原有内存和磁盘状态。
+
+## 开发
+
+在独立开发环境中安装 AstrBot SDK 和检查工具，然后在仓库目录运行：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest
+ruff check .
+ruff format --check .
+```
+
+开发测试固定使用 AstrBot 4.29.4 SDK 和 Python 3.12，运行接口最低要求见插件元数据。测试自动隔离 SDK 数据目录，覆盖永久记录持久化、临时到期、范围与 Bot 隔离、旧数据迁移、管理权限以及保存失败处理；GitHub Actions 会自动运行相同检查。
+
+## 开源说明
+
+本插件由 TenmaGabriel0721 重写维护，基于 [长安某 / zgojin 的 astrbot_plugin_LLMTempBan](https://github.com/zgojin/astrbot_plugin_LLMTempBan) 的功能与本地维护版本扩展。
+
+采用 GNU AGPL v3.0，保留原项目许可证。详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
