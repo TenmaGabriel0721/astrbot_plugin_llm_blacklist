@@ -6,7 +6,7 @@ AstrBot 黑名单插件，支持 LLM 自主临时拉黑、永久拉黑，以及�
 
 本插件控制 Bot 对用户的交互响应。聊天平台的群禁言功能请使用群管理插件。
 
-## 安装与升级
+## 安装
 
 要求 AstrBot `>=4.16,<5`，Python `>=3.10`。插件没有额外运行时依赖。
 
@@ -15,12 +15,6 @@ AstrBot 黑名单插件，支持 LLM 自主临时拉黑、永久拉黑，以及�
 ```text
 https://github.com/TenmaGabriel0721/astrbot_plugin_llm_blacklist
 ```
-
-如果正在使用 `astrbot_plugin_llmtempban`：
-
-1. 先停用旧插件，并保留其 `data/plugin_data/astrbot_plugin_llmtempban/blacklist.json`。
-2. 安装并启用本插件。两个插件使用相同的 `llm_blacklist_manage` 工具名，避免同时启用。
-3. 手动将需要保留的旧插件配置填入本插件配置页面；首次加载会自动迁移有效黑名单记录。
 
 使用会话配置或插件白名单时，确认相应 `plugin_set` 包含 `astrbot_plugin_llm_blacklist`。如需 LLM 自主处理，在该会话使用的人格中启用 `llm_blacklist_manage` 工具。
 
@@ -110,19 +104,15 @@ AstrBot 管理员、Bot 自身和 `protected_user_ids` 中的用户受到保护�
 
 上述拦截作用于插件执行后的消息处理链。AstrBot 提前解析指令时产生的参数错误或权限提示、已有等待会话的回调，以及其他插件直接调用平台接口的主动消息，可能发生在该拦截范围之外。
 
-## 数据与迁移
+## 数据存储
 
-新数据保存在 AstrBot 数据目录下：
+黑名单数据保存在 AstrBot 数据目录下：
 
 ```text
 data/plugin_data/astrbot_plugin_llm_blacklist/blacklist.json
 ```
 
 记录包含用户、平台实例、Bot、范围、原因、创建时间、到期时间和操作来源。永久记录的 `expires_at` 为 `null`。重载插件或重启 AstrBot 后仍会保留有效记录；过期记录不再拦截消息，并在后续写入时清理。
-
-首次加载且新数据库不存在时，自动读取旧插件的 `blacklist.json`，支持旧版用户 ID → 到期时间格式和带范围的记录格式。迁移完成后创建新数据库，后续加载使用新数据库，不会重复导入。旧文件原样保留，旧配置需要手动转移。
-
-旧记录缺少平台实例、Bot 身份，因此保持原范围：**旧版全局记录仍覆盖全部 Bot**，并在列表中注明。旧版群聊和会话记录保留其原范围；旧版全局记录被解封时，其覆盖的全部 Bot 同时解除该记录。
 
 数据库格式损坏或记录无效时会明确报错，停止加载，避免以空黑名单覆盖原文件。保存采用原子替换，并发操作串行提交；保存失败时保留原有内存和磁盘状态。
 
@@ -137,10 +127,8 @@ ruff check .
 ruff format --check .
 ```
 
-开发测试固定使用 AstrBot 4.29.4 SDK 和 Python 3.12，运行接口最低要求见插件元数据。测试自动隔离 SDK 数据目录，覆盖永久记录持久化、临时到期、范围与 Bot 隔离、旧数据迁移、管理权限以及保存失败处理；GitHub Actions 会自动运行相同检查。
+开发测试固定使用 AstrBot 4.29.4 SDK 和 Python 3.12，运行接口最低要求见插件元数据。测试自动隔离 SDK 数据目录，覆盖永久记录持久化、临时到期、范围与 Bot 隔离、管理权限以及保存失败处理；GitHub Actions 会自动运行相同检查。
 
 ## 开源说明
 
-本插件由 TenmaGabriel0721 重写维护，基于 [长安某 / zgojin 的 astrbot_plugin_LLMTempBan](https://github.com/zgojin/astrbot_plugin_LLMTempBan) 的功能与本地维护版本扩展。
-
-采用 GNU AGPL v3.0，保留原项目许可证。详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+本插件由 TenmaGabriel0721 维护，采用 GNU AGPL v3.0。详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
