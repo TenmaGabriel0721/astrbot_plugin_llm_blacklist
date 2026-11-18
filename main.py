@@ -10,6 +10,7 @@ from sys import maxsize
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.message_components import At, AtAll, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.star.filter.command import CommandFilter
@@ -30,15 +31,16 @@ DIRECT_COMMAND_ACTIONS = {
 }
 HELP_TEXT = (
     "下头，拉黑了 · 管理员指令\n"
-    "/拉黑 用户ID [分钟] [原因]\n"
-    "/永久拉黑 用户ID [原因]\n"
-    "/解除拉黑 用户ID\n"
+    "/拉黑 @用户或用户ID [分钟] [原因]\n"
+    "/永久拉黑 @用户或用户ID [原因]\n"
+    "/解除拉黑 @用户或用户ID\n"
     "/黑名单 列表 [页码]\n"
-    "/黑名单 查询 用户ID\n"
-    "/黑名单 拉黑 用户ID [分钟] [原因]\n"
-    "/黑名单 永久 用户ID [原因]\n"
-    "/黑名单 解封 用户ID\n"
+    "/黑名单 查询 @用户或用户ID\n"
+    "/黑名单 拉黑 @用户或用户ID [分钟] [原因]\n"
+    "/黑名单 永久 @用户或用户ID [原因]\n"
+    "/黑名单 解封 @用户或用户ID\n"
     "也可使用 /llm拉黑、/llm永久拉黑、/llm解除拉黑。\n"
+    "查询、拉黑、永久和解封均支持真实 @用户；一次只操作一个目标。\n"
     "临时拉黑省略分钟时使用默认值；填写原因时需同时填写分钟。\n"
     "拉黑范围由 ban_scope 配置决定；解封移除当前会话中对该用户生效的全部记录。"
 )
@@ -143,6 +145,47 @@ class LLMBlacklistPlugin(Star):
         ):
             raise ValueError("用户 ID 不能为空、包含空白或超过 256 个字符。")
         return user_id
+
+    @staticmethod
+    def _command_tokens(event: AstrMessageEvent) -> list[str | At]:
+        """Keep positional mention IDs instead of parsing displayed nicknames.
+
+        Args:
+            event: Command event after AstrBot has removed the wake prefix.
+
+        Returns:
+            Command tokens containing text or original mention components.
+
+        Raises:
+            ValueError: If the component chain does not locate the command.
+        """
+        raw_tokens = event.get_message_str().strip().split()
+        messages = event.get_messages()
+        if not raw_tokens or not any(isinstance(item, At) for item in messages):
+            return raw_tokens
+        tokens: list[str | At] = []
+        text = ""
+        for item in messages:
+            if isinstance(item, Plain):
+                text += item.text
+            elif isinstance(item, At):
+                tokens.extend(text.split())
+                text = ""
+                if not tokens and str(item.qq) == str(event.get_self_id()):
+                    continue
+                tokens.append(item)
+        tokens.extend(text.split())
+        if (
+            not tokens
+            or not isinstance(tokens[0], str)
+            or not tokens[0].endswith(raw_tokens[0])
+        ):
+            raise ValueError(
+                "无法解析指令，请将 @用户 放在指令的目标位置，或填写用户 ID。"
+            )
+        # The original Plain component still contains AstrBot's wake prefix.
+        tokens[0] = raw_tokens[0]
+        return tokens
 
     @staticmethod
     def _identity(event: AstrMessageEvent) -> BanContext:
@@ -407,17 +450,10 @@ class LLMBlacklistPlugin(Star):
             yield event.plain_result("仅 AstrBot 管理员可以管理黑名单。")
             return
         event.should_call_llm(True)
-        # AstrBot strips the wake prefix before evaluating CommandFilter.
-        tokens = event.get_message_str().strip().split()
-        direct_action = DIRECT_COMMAND_ACTIONS.get(tokens[0]) if tokens else None
-        if direct_action is not None:
-            action = direct_action
-            args = tokens[1:]
-        else:
-            # A direct alias may also match the nested action during SDK parsing.
-            if len(tokens) > 1:
-                action = tokens[1]
-            args = tokens[2:]
+        raw_tokens = event.get_message_str().strip().split()
+        direct_action = (
+            DIRECT_COMMAND_ACTIONS.get(raw_tokens[0]) if raw_tokens else None
+        )
         if self.store is None:
             yield event.plain_result("黑名单尚未完成初始化。")
             if direct_action is not None:
@@ -425,6 +461,31 @@ class LLMBlacklistPlugin(Star):
             return
         identity = self._identity(event)
         try:
+            tokens = self._command_tokens(event)
+            if direct_action is not None:
+                action = direct_action
+                args = tokens[1:]
+            else:
+                # A direct alias may also match the nested action during SDK parsing.
+                if len(tokens) > 1:
+                    if not isinstance(tokens[1], str):
+                        raise ValueError(
+                            "请指定黑名单操作；使用 /黑名单 帮助 查看格式。"
+                        )
+                    action = tokens[1]
+                args = tokens[2:]
+            if action in {"查询", "拉黑", "永久", "解封"} and args:
+                target = args[0]
+                if isinstance(target, At):
+                    if isinstance(target, AtAll) or str(target.qq).lower() == "all":
+                        raise ValueError("不能将 @全体成员 作为目标，请指定一个用户。")
+                    if len(args) > 1 and isinstance(args[1], At):
+                        raise ValueError("一次指令只能指定一个目标用户。")
+                    args[0] = self._normalize_user_id(target.qq)
+                elif target.startswith(("@", "[CQ:at", "[At:", "<@")):
+                    raise ValueError(
+                        "请通过聊天客户端选择用户进行 @，或直接填写用户 ID。"
+                    )
             if action == "列表":
                 if len(args) > 1:
                     raise ValueError("格式：/黑名单 列表 [页码]")
@@ -454,7 +515,7 @@ class LLMBlacklistPlugin(Star):
                     result = "\n".join(lines)
             elif action == "查询":
                 if len(args) != 1:
-                    raise ValueError("格式：/黑名单 查询 用户ID")
+                    raise ValueError("格式：/黑名单 查询 @用户或用户ID")
                 user_id = self._normalize_user_id(args[0])
                 record = self.store.get_active(user_id, identity)
                 result = (
@@ -464,7 +525,9 @@ class LLMBlacklistPlugin(Star):
                 )
             elif action in {"拉黑", "永久", "解封"}:
                 if not args or (action == "解封" and len(args) != 1):
-                    raise ValueError("请指定用户 ID；使用 /黑名单 帮助 查看格式。")
+                    raise ValueError(
+                        "请 @一个用户 或填写用户 ID；使用 /黑名单 帮助 查看格式。"
+                    )
                 duration = -1
                 reason_start = 1
                 if action == "解封":
@@ -474,11 +537,18 @@ class LLMBlacklistPlugin(Star):
                     reason_start = 2
                     if duration <= 0:
                         raise ValueError("临时拉黑时长必须大于 0；解封请用 /解除拉黑。")
+                reason_parts = []
+                for item in args[reason_start:]:
+                    if isinstance(item, At):
+                        item = (
+                            f"@{item.name}({item.qq})" if item.name else f"@{item.qq}"
+                        )
+                    reason_parts.append(item)
                 result = await self._manage_blacklist(
                     event,
                     args[0],
                     duration,
-                    " ".join(args[reason_start:]) or "管理员操作",
+                    " ".join(reason_parts) or "管理员操作",
                     action == "永久",
                     "admin",
                 )

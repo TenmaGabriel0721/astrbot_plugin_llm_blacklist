@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 from astrbot.api.event import MessageEventResult
+from astrbot.api.message_components import At, AtAll, Plain
 from astrbot.core.pipeline.process_stage.method.star_request import StarRequestSubStage
 from astrbot.core.pipeline.scheduler import PipelineScheduler
 from astrbot.core.provider.register import llm_tools
@@ -37,12 +38,13 @@ class FakeEvent:
         session_id=None,
         admin=False,
         message="黑名单",
+        messages=None,
     ):
         self.message_obj = SimpleNamespace(
             sender=SimpleNamespace(user_id=user_id),
             self_id=bot_id,
             group_id=group_id,
-            message=[],
+            message=list(messages) if messages is not None else [],
         )
         self.unified_msg_origin = session_id or (
             f"{platform_id}:GroupMessage:{group_id}"
@@ -706,14 +708,32 @@ async def test_uninitialized_direct_command_still_stops_propagation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("duration", ["25", "invalid"])
+@pytest.mark.parametrize(
+    ("duration", "with_mention"),
+    [
+        pytest.param("25", False, id="explicit-id-valid"),
+        pytest.param("invalid", False, id="explicit-id-invalid"),
+        pytest.param("25", True, id="mention-valid"),
+        pytest.param("invalid", True, id="mention-invalid"),
+    ],
+)
 async def test_direct_command_priority_and_stop_prevent_competing_sdk_handler(
-    plugin, command_metadata, monkeypatch, duration
+    plugin, command_metadata, monkeypatch, duration, with_mention
 ):
     event = FakeEvent(
         user_id="owner",
         admin=True,
-        message=f"拉黑 target {duration} repeated harassment",
+        message=f"拉黑 {'@Target Name(target)' if with_mention else 'target'} "
+        f"{duration} repeated harassment",
+        messages=(
+            [
+                Plain("/拉黑 "),
+                At(qq="target", name="Target Name"),
+                Plain(f" {duration} repeated harassment"),
+            ]
+            if with_mention
+            else None
+        ),
     )
     calls = []
 
@@ -779,6 +799,388 @@ async def test_direct_command_priority_and_stop_prevent_competing_sdk_handler(
         assert "操作失败" in responses[0]
         assert record is None
     assert event.call_llm
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "rendered_mention", "target"),
+    [
+        ("拉黑", "@Target Name With Spaces(123456)", 123456),
+        ("llm拉黑", "", "openid-target"),
+        ("黑名单 拉黑", "@Target Name With Spaces", "openid-target"),
+        ("llm黑名单 拉黑", "<@openid-target>", "openid-target"),
+    ],
+)
+async def test_temporary_mention_uses_component_id_and_plain_arguments(
+    plugin, command_metadata, command, rendered_mention, target
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} {rendered_mention} 25 repeated harassment",
+        messages=[
+            Plain(f"/{command} "),
+            At(qq=target, name="Target Name With Spaces"),
+            Plain(" 25 repeated harassment"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active(str(target), identity(event))
+    assert record is not None
+    assert record.expires_at == CLOCK + 25 * 60
+    assert record.reason == "repeated harassment"
+    assert record.source == "admin"
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+    assert event.call_llm
+    assert event.stopped == (command in {"拉黑", "llm拉黑"})
+
+
+@pytest.mark.asyncio
+async def test_temporary_mention_without_arguments_uses_default_duration(
+    plugin, command_metadata
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message="拉黑",
+        messages=[Plain("/拉黑 "), At(qq="openid-target", name="")],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("openid-target", identity(event))
+    assert record is not None
+    assert record.expires_at == CLOCK + 10 * 60
+    assert record.reason == "管理员操作"
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command", ["永久拉黑", "llm永久拉黑", "黑名单 永久", "llm黑名单 永久"]
+)
+async def test_permanent_mention_uses_component_id_and_multiword_reason(
+    plugin, command_metadata, command
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} @Target Name(openid-target) repeated harassment",
+        messages=[
+            Plain(f"/{command} "),
+            At(qq="openid-target", name="Target Name"),
+            Plain(" repeated harassment"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("openid-target", identity(event))
+    assert record is not None
+    assert record.expires_at is None
+    assert record.reason == "repeated harassment"
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+    assert event.call_llm
+    assert event.stopped == (command in {"永久拉黑", "llm永久拉黑"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "unban"),
+    [
+        ("解除拉黑", True),
+        ("llm解除拉黑", True),
+        ("黑名单 解封", True),
+        ("llm黑名单 解封", True),
+        ("黑名单 查询", False),
+        ("llm黑名单 查询", False),
+    ],
+)
+async def test_mention_query_and_unban_use_actual_id(
+    plugin, command_metadata, command, unban
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "openid-target", permanent=True)
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} @Target Name(openid-target)",
+        messages=[
+            Plain(f"/{command} "),
+            At(qq="openid-target", name="Target Name"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    text = results[0].get_plain_text()
+    record = plugin.store.get_active("openid-target", identity(event))
+    if unban:
+        assert "已解除用户 openid-target" in text
+        assert record is None
+    else:
+        assert "用户：openid-target" in text
+        assert "永久" in text
+        assert record is not None
+    assert event.call_llm
+    assert event.stopped == (command in {"解除拉黑", "llm解除拉黑"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake_prefix", ["/", "!"])
+async def test_leading_bot_wake_mention_is_skipped_before_target(
+    plugin, command_metadata, wake_prefix
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message="拉黑 @Target Name(openid-target) 25 repeated harassment",
+        messages=[
+            At(qq="bot-A", name="Bot Name"),
+            Plain(f"{wake_prefix}拉黑 "),
+            At(qq="openid-target", name="Target Name"),
+            Plain(" 25 repeated harassment"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("openid-target", identity(event))
+    assert record is not None
+    assert record.expires_at == CLOCK + 25 * 60
+    assert record.reason == "repeated harassment"
+    assert plugin.store.get_active("bot-A", identity(event)) is None
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+async def test_adjacent_plain_components_are_joined_around_mention(
+    plugin, command_metadata
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message="拉黑 @Target(target) 25 repeated harassment",
+        messages=[
+            Plain("/拉"),
+            Plain("黑 "),
+            At(qq="target", name="Target"),
+            Plain(" 2"),
+            Plain("5 repeated "),
+            Plain("harassment"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("target", identity(event))
+    assert record is not None
+    assert record.expires_at == CLOCK + 25 * 60
+    assert record.reason == "repeated harassment"
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["拉黑", "永久拉黑"])
+async def test_reason_mention_does_not_override_explicit_target_id(
+    plugin, command_metadata, command
+):
+    duration = " 25" if command == "拉黑" else ""
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} explicit-target{duration} repeated harassment of "
+        "@Other Name(mentioned-target)",
+        messages=[
+            Plain(f"/{command} explicit-target{duration} repeated harassment of "),
+            At(qq="mentioned-target", name="Other Name"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("explicit-target", identity(event))
+    assert record is not None
+    assert record.reason == "repeated harassment of @Other Name(mentioned-target)"
+    assert record.expires_at == (CLOCK + 25 * 60 if command == "拉黑" else None)
+    assert plugin.store.get_active("mentioned-target", identity(event)) is None
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "reason_prefix", "name", "expected_reason"),
+    [
+        ("拉黑", " 25 ", "Other Name", "@Other Name(mentioned-target)"),
+        (
+            "永久拉黑",
+            " repeated harassment of ",
+            "",
+            "repeated harassment of @mentioned-target",
+        ),
+    ],
+)
+async def test_reason_mention_is_allowed_after_duration_or_reason_text(
+    plugin, command_metadata, command, reason_prefix, name, expected_reason
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} @Target(target){reason_prefix}@Other Name(mentioned-target)",
+        messages=[
+            Plain(f"/{command} "),
+            At(qq="target", name="Target"),
+            Plain(reason_prefix),
+            At(qq="mentioned-target", name=name),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("target", identity(event))
+    assert record is not None
+    assert record.reason == expected_reason
+    assert plugin.store.get_active("mentioned-target", identity(event)) is None
+    assert "已保存拉黑记录" in results[0].get_plain_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", [At(qq="all", name="全体成员"), AtAll()])
+async def test_mention_all_is_rejected_without_mutation(
+    plugin, command_metadata, target
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message="永久拉黑",
+        messages=[Plain("/永久拉黑 "), target],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "操作失败" in results[0].get_plain_text()
+    assert plugin.store.list_records(identity(event)) == []
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["拉黑", "永久拉黑", "解除拉黑"])
+async def test_adjacent_target_mentions_are_rejected_without_mutation(
+    plugin, command_metadata, command
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} @First(first-target) @Second(second-target)",
+        messages=[
+            Plain(f"/{command} "),
+            At(qq="first-target", name="First"),
+            Plain(" "),
+            At(qq="second-target", name="Second"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "操作失败" in results[0].get_plain_text()
+    assert plugin.store.list_records(identity(event)) == []
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["黑名单 查询", "黑名单 解封"])
+async def test_query_and_unban_mention_require_single_target(
+    plugin, command_metadata, command
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    before = plugin.store.path.read_bytes()
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"{command} @Target(target) extra text @Other(other-target)",
+        messages=[
+            Plain(f"/{command} "),
+            At(qq="target", name="Target"),
+            Plain(" extra text "),
+            At(qq="other-target", name="Other"),
+        ],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "操作失败" in results[0].get_plain_text()
+    assert plugin.store.get_active("target", identity(event)).expires_at is None
+    assert plugin.store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["拉黑", "永久拉黑", "解除拉黑"])
+async def test_nonadmin_mention_cannot_ban_or_unban(plugin, command_metadata, command):
+    await plugin.llm_blacklist_manage(FakeEvent(), "existing-target", permanent=True)
+    before = plugin.store.path.read_bytes()
+    target = "existing-target" if command == "解除拉黑" else "new-target"
+    event = FakeEvent(
+        message=f"{command} @Target({target})",
+        messages=[Plain(f"/{command} "), At(qq=target, name="Target")],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "仅 AstrBot 管理员" in results[0].get_plain_text()
+    assert plugin.store.get_active("new-target", identity(event)) is None
+    assert (
+        plugin.store.get_active("existing-target", identity(event)).expires_at is None
+    )
+    assert plugin.store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["bot-A", "owner", "protected"])
+async def test_postcommand_mention_preserves_protected_user_policy(
+    plugin_factory, command_metadata, target
+):
+    plugin = await plugin_factory(protected_user_ids=["protected"])
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=f"永久拉黑 @Target({target})",
+        messages=[Plain("/永久拉黑 "), At(qq=target, name="Target")],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    assert "不能拉黑" in results[0].get_plain_text()
+    assert plugin.store.list_records(identity(event)) == []
+    assert event.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target", ["@nickname", "@nickname(123456)", "[At:123456]", "<@123456>"]
+)
+async def test_plain_mention_text_requires_real_component_or_user_id(
+    plugin, command_metadata, target
+):
+    message = f"永久拉黑 {target} repeated harassment"
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message=message,
+        messages=[Plain(f"/{message}")],
+    )
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    text = results[0].get_plain_text()
+    assert "操作失败" in text
+    assert "ID" in text
+    assert "艾特" in text or "@" in text
+    assert plugin.store.list_records(identity(event)) == []
     assert event.stopped
 
 
