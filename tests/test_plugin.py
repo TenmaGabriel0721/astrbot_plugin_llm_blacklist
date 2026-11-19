@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -11,7 +12,7 @@ from astrbot.core.pipeline.scheduler import PipelineScheduler
 from astrbot.core.provider.register import llm_tools
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
-from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
+from astrbot.core.star.filter.permission import PermissionTypeFilter
 from astrbot.core.star.star import StarMetadata, star_map
 from astrbot.core.star.star_handler import (
     EventType,
@@ -39,9 +40,11 @@ class FakeEvent:
         admin=False,
         message="黑名单",
         messages=None,
+        nickname="",
+        platform_name="test",
     ):
         self.message_obj = SimpleNamespace(
-            sender=SimpleNamespace(user_id=user_id),
+            sender=SimpleNamespace(user_id=user_id, nickname=nickname),
             self_id=bot_id,
             group_id=group_id,
             message=list(messages) if messages is not None else [],
@@ -53,6 +56,7 @@ class FakeEvent:
         )
         self._group_id = group_id
         self._platform_id = platform_id
+        self._platform_name = platform_name
         self._bot_id = bot_id
         self._admin = admin
         self.message_str = message
@@ -66,11 +70,17 @@ class FakeEvent:
     def get_sender_id(self):
         return self.message_obj.sender.user_id
 
+    def get_sender_name(self):
+        return self.message_obj.sender.nickname
+
     def get_group_id(self):
         return self._group_id
 
     def get_platform_id(self):
         return self._platform_id
+
+    def get_platform_name(self):
+        return self._platform_name
 
     def get_self_id(self):
         return self._bot_id
@@ -161,7 +171,6 @@ def plugin_factory(tmp_path, monkeypatch):
         config = {
             "default_blacklist_duration": 10,
             "max_blacklist_duration": 1440,
-            "ban_scope": "global",
             "strict_block_mode": True,
             "allow_llm_permanent_ban": True,
             "protected_user_ids": [],
@@ -306,12 +315,25 @@ async def test_global_scope_is_separate_for_each_bot_and_platform(plugin):
 
 
 @pytest.mark.asyncio
-async def test_changing_creation_scope_does_not_disable_existing_group_ban(
-    plugin_factory,
+async def test_existing_group_ban_can_be_read_and_unbanned_after_reload(
+    plugin_factory, command_metadata
 ):
-    plugin = await plugin_factory(ban_scope="group")
-    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
-    plugin = await plugin_factory(ban_scope="session")
+    plugin = await plugin_factory()
+    plugin.store.ban(
+        BanRecord(
+            user_id="target",
+            platform_id="platform-A",
+            bot_id="bot-A",
+            scope="group",
+            scope_id="group-A",
+            reason="Historical group record",
+            created_at=CLOCK,
+            expires_at=None,
+            operator="owner",
+            source="admin",
+        )
+    )
+    plugin = await plugin_factory()
     matching = FakeEvent(user_id="target")
     unrelated = FakeEvent(user_id="target", group_id="group-B")
 
@@ -321,11 +343,35 @@ async def test_changing_creation_scope_does_not_disable_existing_group_ban(
     assert matching.stopped
     assert not unrelated.stopped
 
+    query = FakeEvent(message="黑名单 查询 target")
+    results = await invoke_blacklist_command(plugin, query, command_metadata)
+    assert "用户：target" in results[0].get_plain_text()
+    assert "群聊 group-A" in results[0].get_plain_text()
+    unban = FakeEvent(user_id="owner", admin=True, message="解除拉黑 target")
+    results = await invoke_blacklist_command(plugin, unban, command_metadata)
+    assert "已解除用户 target" in results[0].get_plain_text()
+    assert plugin.store.get_active("target", identity(matching)) is None
+
 
 @pytest.mark.asyncio
-async def test_session_scope_distinguishes_branches_of_same_group(plugin_factory):
-    plugin = await plugin_factory(ban_scope="session")
-    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+async def test_historical_session_scope_distinguishes_branches_of_same_group(
+    plugin_factory,
+):
+    plugin = await plugin_factory()
+    plugin.store.ban(
+        BanRecord(
+            user_id="target",
+            platform_id="platform-A",
+            bot_id="bot-A",
+            scope="session",
+            scope_id="platform-A:GroupMessage:group-A",
+            reason="Historical session record",
+            created_at=CLOCK,
+            expires_at=None,
+            operator="owner",
+            source="admin",
+        )
+    )
     matching = FakeEvent(user_id="target")
     unrelated = FakeEvent(
         user_id="target", session_id="platform-A:GroupMessage:group-A-branch"
@@ -336,6 +382,31 @@ async def test_session_scope_distinguishes_branches_of_same_group(plugin_factory
 
     assert matching.stopped
     assert not unrelated.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("obsolete_scope", ["group", "session", "invalid"])
+@pytest.mark.parametrize("source", ["admin", "llm"])
+async def test_new_bans_are_global_even_with_obsolete_scope_setting(
+    plugin_factory, command_metadata, obsolete_scope, source
+):
+    plugin = await plugin_factory(ban_scope=obsolete_scope)
+    actor = FakeEvent(user_id="owner", admin=True, message="永久拉黑 target")
+    if source == "admin":
+        await invoke_blacklist_command(plugin, actor, command_metadata)
+    else:
+        await plugin.llm_blacklist_manage(actor, "target", permanent=True)
+
+    record = plugin.store.get_active("target", identity(actor))
+    assert record.scope == "global"
+    assert record.scope_id == ""
+    elsewhere = FakeEvent(
+        user_id="target",
+        group_id="another-group",
+        session_id="platform-A:GroupMessage:another-group-branch",
+    )
+    await plugin.block_blacklisted_messages(elsewhere)
+    assert elsewhere.stopped
 
 
 @pytest.mark.asyncio
@@ -473,7 +544,9 @@ def test_real_sdk_tool_schema_exposes_permanent_boolean():
     assert "duration_minutes" in tool.parameters["properties"]
 
 
-def test_admin_command_aliases_keep_native_permission_and_priority(command_metadata):
+def test_shared_command_aliases_keep_priority_and_allow_public_filtering(
+    command_metadata,
+):
     command_filters = [
         event_filter
         for event_filter in command_metadata.event_filters
@@ -491,13 +564,10 @@ def test_admin_command_aliases_keep_native_permission_and_priority(command_metad
         "llm解除拉黑",
     }
     assert command_metadata.extras_configs["priority"] == 100
-    permission_filter = next(
-        event_filter
+    assert not any(
+        isinstance(event_filter, PermissionTypeFilter)
         for event_filter in command_metadata.event_filters
-        if isinstance(event_filter, PermissionTypeFilter)
     )
-    assert permission_filter.permission_type == PermissionType.ADMIN
-    assert permission_filter.raise_error is False
 
 
 @pytest.mark.asyncio
@@ -575,13 +645,6 @@ async def test_nonadmin_cannot_manage_blacklist_even_if_handler_called_directly(
     await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
     before = plugin.store.path.read_bytes()
     event = FakeEvent(message=message)
-    permission_filter = next(
-        event_filter
-        for event_filter in command_metadata.event_filters
-        if isinstance(event_filter, PermissionTypeFilter)
-    )
-    assert not permission_filter.filter(event, {})
-
     results = await invoke_blacklist_command(plugin, event, command_metadata)
 
     assert "仅 AstrBot 管理员" in results[0].get_plain_text()
@@ -833,6 +896,7 @@ async def test_temporary_mention_uses_component_id_and_plain_arguments(
     assert record.expires_at == CLOCK + 25 * 60
     assert record.reason == "repeated harassment"
     assert record.source == "admin"
+    assert record.nickname == "Target Name With Spaces"
     assert "已保存拉黑记录" in results[0].get_plain_text()
     assert event.call_llm
     assert event.stopped == (command in {"拉黑", "llm拉黑"})
@@ -883,6 +947,7 @@ async def test_permanent_mention_uses_component_id_and_multiword_reason(
     assert record is not None
     assert record.expires_at is None
     assert record.reason == "repeated harassment"
+    assert record.nickname == "Target Name"
     assert "已保存拉黑记录" in results[0].get_plain_text()
     assert event.call_llm
     assert event.stopped == (command in {"永久拉黑", "llm永久拉黑"})
@@ -952,6 +1017,7 @@ async def test_leading_bot_wake_mention_is_skipped_before_target(
     assert record is not None
     assert record.expires_at == CLOCK + 25 * 60
     assert record.reason == "repeated harassment"
+    assert record.nickname == "Target Name"
     assert plugin.store.get_active("bot-A", identity(event)) is None
     assert "已保存拉黑记录" in results[0].get_plain_text()
     assert event.stopped
@@ -1006,6 +1072,7 @@ async def test_reason_mention_does_not_override_explicit_target_id(
     record = plugin.store.get_active("explicit-target", identity(event))
     assert record is not None
     assert record.reason == "repeated harassment of @Other Name(mentioned-target)"
+    assert record.nickname == ""
     assert record.expires_at == (CLOCK + 25 * 60 if command == "拉黑" else None)
     assert plugin.store.get_active("mentioned-target", identity(event)) is None
     assert "已保存拉黑记录" in results[0].get_plain_text()
@@ -1045,6 +1112,7 @@ async def test_reason_mention_is_allowed_after_duration_or_reason_text(
     record = plugin.store.get_active("target", identity(event))
     assert record is not None
     assert record.reason == expected_reason
+    assert record.nickname == "Target"
     assert plugin.store.get_active("mentioned-target", identity(event)) is None
     assert "已保存拉黑记录" in results[0].get_plain_text()
 
@@ -1182,6 +1250,351 @@ async def test_plain_mention_text_requires_real_component_or_user_id(
     assert "艾特" in text or "@" in text
     assert plugin.store.list_records(identity(event)) == []
     assert event.stopped
+
+
+@pytest.mark.asyncio
+async def test_nickname_survives_reload_and_readonly_commands_use_saved_snapshot(
+    plugin, plugin_factory, command_metadata
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        message="永久拉黑 @Saved Name(target)",
+        messages=[Plain("/永久拉黑 "), At(qq="target", name="  下头 张三\n ")],
+    )
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+    assert "用户：target" in results[0].get_plain_text()
+    assert "昵称：下头 张三" in results[0].get_plain_text()
+    payload = json.loads(plugin.store.path.read_text())
+    assert payload["records"][0]["nickname"] == "下头 张三"
+
+    restarted = await plugin_factory()
+    before = restarted.store.path.read_bytes()
+    for message, components in [
+        ("黑名单", None),
+        (
+            "黑名单 查询 @New Name(target)",
+            [Plain("/黑名单 查询 "), At(qq="target", name="后来改名")],
+        ),
+    ]:
+        reader = FakeEvent(message=message, messages=components)
+        results = await invoke_blacklist_command(restarted, reader, command_metadata)
+        assert "用户：target" in results[0].get_plain_text()
+        assert "昵称：下头 张三" in results[0].get_plain_text()
+        assert "后来改名" not in results[0].get_plain_text()
+    assert restarted.store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_llm_nickname_uses_matching_mention_not_wake_bot_or_other_users(plugin):
+    event = FakeEvent(
+        nickname="Operator Name",
+        messages=[
+            At(qq="bot-A", name="Wake Bot"),
+            At(qq="unrelated", name="Other User"),
+            At(qq="target", name=" Target\n Name "),
+        ],
+    )
+
+    result = await plugin.llm_blacklist_manage(event, "target", permanent=True)
+
+    assert plugin.store.get_active("target", identity(event)).nickname == "Target Name"
+    assert "昵称：Target Name" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["actor", "other-target"])
+async def test_sender_nickname_is_only_used_for_the_sender_target(plugin, target):
+    event = FakeEvent(nickname=" Sender\t Name ")
+
+    result = await plugin.llm_blacklist_manage(event, target, permanent=True)
+
+    expected = "Sender Name" if target == "actor" else ""
+    record = plugin.store.get_active(target, identity(event))
+    assert record.nickname == expected
+    assert f"昵称：{expected or '未记录'}" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("responses", "expected_name", "expected_actions"),
+    [
+        (
+            [{"card": " Group Card ", "nickname": "Account Name"}],
+            "Group Card",
+            ["get_group_member_info"],
+        ),
+        (
+            [{"card": "", "nickname": " Group Nickname "}],
+            "Group Nickname",
+            ["get_group_member_info"],
+        ),
+        (
+            [{"card": "", "nickname": ""}, {"nick": " Stranger Name "}],
+            "Stranger Name",
+            ["get_group_member_info", "get_stranger_info"],
+        ),
+        (
+            [RuntimeError("Member unavailable"), {"nickname": "Fallback Name"}],
+            "Fallback Name",
+            ["get_group_member_info", "get_stranger_info"],
+        ),
+    ],
+)
+async def test_direct_id_nickname_lookup_uses_bot_routing_and_group_card_priority(
+    plugin, command_metadata, responses, expected_name, expected_actions
+):
+    event = FakeEvent(
+        user_id="owner",
+        admin=True,
+        group_id="654321",
+        bot_id="999999",
+        platform_name="aiocqhttp",
+        message="永久拉黑 123456",
+    )
+    event.bot = SimpleNamespace(call_action=AsyncMock(side_effect=responses))
+
+    results = await invoke_blacklist_command(plugin, event, command_metadata)
+
+    record = plugin.store.get_active("123456", identity(event))
+    assert record.nickname == expected_name
+    assert f"昵称：{expected_name}" in results[0].get_plain_text()
+    calls = event.bot.call_action.await_args_list
+    assert [item.kwargs["action"] for item in calls] == expected_actions
+    for item in calls:
+        assert item.kwargs["self_id"] == "999999"
+        assert item.kwargs["user_id"] == 123456
+        assert item.kwargs["no_cache"] is False
+        if item.kwargs["action"] == "get_group_member_info":
+            assert item.kwargs["group_id"] == 654321
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [None, [], "invalid", {"nickname": None}])
+async def test_unavailable_nickname_lookup_does_not_prevent_ban(plugin, response):
+    event = FakeEvent(group_id="", platform_name="aiocqhttp")
+    event.bot = SimpleNamespace(call_action=AsyncMock(return_value=response))
+
+    result = await plugin.llm_blacklist_manage(event, "123456", permanent=True)
+
+    record = plugin.store.get_active("123456", identity(event))
+    assert record is not None
+    assert record.nickname == ""
+    assert "已保存拉黑记录" in result
+    assert "昵称：未记录" in result
+
+
+@pytest.mark.asyncio
+async def test_nickname_lookup_timeout_does_not_prevent_ban(plugin):
+    event = FakeEvent(group_id="", platform_name="aiocqhttp")
+    event.bot = SimpleNamespace(call_action=AsyncMock(side_effect=TimeoutError))
+
+    result = await plugin.llm_blacklist_manage(event, "123456", permanent=True)
+
+    assert plugin.store.get_active("123456", identity(event)).nickname == ""
+    assert "已保存拉黑记录" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_mention", [True, False])
+async def test_nickname_lookup_skips_network_for_known_mentions_or_openids(
+    plugin, known_mention
+):
+    target = "123456" if known_mention else "openid-target"
+    components = [At(qq=target, name="Known Name")] if known_mention else []
+    event = FakeEvent(platform_name="aiocqhttp", messages=components)
+    event.bot = SimpleNamespace(call_action=AsyncMock())
+
+    await plugin.llm_blacklist_manage(event, target, permanent=True)
+
+    event.bot.call_action.assert_not_awaited()
+    assert plugin.store.get_active(target, identity(event)).nickname == (
+        "Known Name" if known_mention else ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_ban_keeps_known_nickname_and_updates_a_new_snapshot(plugin):
+    event = FakeEvent(messages=[At(qq="target", name="Original Name")])
+    await plugin.llm_blacklist_manage(event, "target", permanent=True)
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", duration_minutes=1)
+    assert (
+        plugin.store.get_active("target", identity(event)).nickname == "Original Name"
+    )
+
+    renamed = FakeEvent(messages=[At(qq="target", name="Updated Name")])
+    await plugin.llm_blacklist_manage(renamed, "target", duration_minutes=1)
+    record = plugin.store.get_active("target", identity(event))
+    assert record.nickname == "Updated Name"
+    assert record.expires_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("黑名单", "黑名单（"),
+        ("llm黑名单", "黑名单（"),
+        ("黑名单 列表", "黑名单（"),
+        ("llm黑名单 列表", "黑名单（"),
+        ("黑名单 查询 target", "用户：target"),
+        ("llm黑名单 查询 target", "用户：target"),
+        ("黑名单 帮助", "黑名单"),
+    ],
+)
+async def test_public_blacklist_readonly_commands_are_available_to_nonadmins(
+    plugin, command_metadata, message, expected
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "target", permanent=True)
+    before = plugin.store.path.read_bytes()
+    reader = FakeEvent(user_id="ordinary-user", message=message)
+
+    results = await invoke_blacklist_command(plugin, reader, command_metadata)
+
+    assert len(results) == 1
+    assert expected in results[0].get_plain_text()
+    assert "仅 AstrBot 管理员" not in results[0].get_plain_text()
+    assert plugin.store.path.read_bytes() == before
+    assert reader.call_llm
+    assert not reader.stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize(
+    "message", ["黑名单", "llm黑名单 列表", "黑名单 查询 target", "黑名单 帮助"]
+)
+async def test_blacklisted_public_readonly_command_replies_once_and_stops_sdk_pipeline(
+    plugin_factory, command_metadata, monkeypatch, strict, message
+):
+    plugin = await plugin_factory(strict_block_mode=strict)
+    operator = FakeEvent(user_id="operator")
+    await plugin.llm_blacklist_manage(operator, "target", permanent=True)
+    await plugin.llm_blacklist_manage(operator, "blocked-reader", permanent=True)
+    before = plugin.store.path.read_bytes()
+    event = FakeEvent(user_id="blocked-reader", message=message)
+    command_filter = next(
+        item
+        for item in command_metadata.event_filters
+        if isinstance(item, CommandFilter)
+    )
+    assert command_filter.filter(event, {})
+    parsed_params = dict(event.get_extra("parsed_params"))
+    calls = []
+    responses = []
+    llm_calls = []
+
+    async def prefix(current_event):
+        calls.append("prefix")
+
+    async def blocker(current_event):
+        calls.append("block")
+        await plugin.block_blacklisted_messages(current_event)
+
+    async def competing(current_event):
+        calls.append("competing")
+
+    module_name = "test_public_blacklist_pipeline"
+    prefix_md = StarHandlerMetadata(
+        event_type=EventType.AdapterMessageEvent,
+        handler_full_name=f"{module_name}_prefix",
+        handler_name="prefix",
+        handler_module_path=module_name,
+        handler=prefix,
+        event_filters=[],
+    )
+    competing_md = replace(
+        prefix_md, handler_full_name=f"{module_name}_competing", handler=competing
+    )
+    blocker_md = star_handlers_registry.get_handler_by_full_name(
+        f"{plugin_module.__name__}_block_blacklisted_messages"
+    )
+    assert blocker_md is not None
+    blocker_md = replace(blocker_md, handler=blocker)
+    command_md = replace(command_metadata, handler=plugin.blacklist_command)
+    activated = [prefix_md, blocker_md, command_md, competing_md]
+    event.set_extra("activated_handlers", activated)
+    event.set_extra(
+        "handlers_parsed_params", {command_md.handler_full_name: parsed_params}
+    )
+    monkeypatch.setitem(star_map, module_name, StarMetadata(name="public-reader-spy"))
+    monkeypatch.setitem(
+        star_map, command_md.handler_module_path, StarMetadata(name="blacklist-command")
+    )
+
+    async def handler_stage(current_event):
+        async for result in StarRequestSubStage().process(current_event):
+            yield result
+
+    async def send_spy(current_event):
+        if not current_event.is_stopped() and current_event.get_result() is not None:
+            responses.append(current_event.get_result().get_plain_text())
+            if not current_event.call_llm:
+                llm_calls.append("llm")
+
+    scheduler = PipelineScheduler.__new__(PipelineScheduler)
+    scheduler.stages = [
+        SimpleNamespace(process=handler_stage),
+        SimpleNamespace(process=send_spy),
+    ]
+    await scheduler._process_stages(event)
+
+    assert calls == ["prefix", "block"]
+    assert len(responses) == 1
+    assert "黑名单" in responses[0] or "用户：target" in responses[0]
+    assert llm_calls == []
+    assert event.get_extra("activated_handlers") is activated
+    assert activated == [prefix_md, blocker_md, command_md]
+    assert event.get_extra("llm_blacklist_public_read") is True
+    assert event.stopped
+    assert event.call_llm
+    assert plugin.store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "聊天 黑名单",
+        "黑名单 永久 target",
+        "llm黑名单 解封 blocked-reader",
+        "拉黑 target",
+        "黑名单 未知 target",
+    ],
+)
+async def test_blacklisted_management_or_unrelated_text_does_not_get_public_exemption(
+    plugin, command_metadata, message
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "blocked-reader", permanent=True)
+    before = plugin.store.path.read_bytes()
+    event = FakeEvent(user_id="blocked-reader", message=message)
+    event.set_extra("activated_handlers", [command_metadata])
+
+    await plugin.block_blacklisted_messages(event)
+
+    assert event.stopped
+    assert event.call_llm
+    assert not event.get_extra("llm_blacklist_public_read", False)
+    assert plugin.store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_unrelated_same_named_handler_cannot_get_public_blacklist_exemption(
+    plugin, command_metadata
+):
+    await plugin.llm_blacklist_manage(FakeEvent(), "blocked-reader", permanent=True)
+    event = FakeEvent(user_id="blocked-reader", message="黑名单 列表")
+    spoofed = replace(
+        command_metadata,
+        handler_full_name="unrelated_plugin_blacklist_command",
+        handler_module_path="unrelated_plugin",
+    )
+    event.set_extra("activated_handlers", [spoofed])
+
+    await plugin.block_blacklisted_messages(event)
+
+    assert event.stopped
+    assert not event.get_extra("llm_blacklist_public_read", False)
 
 
 @pytest.mark.asyncio

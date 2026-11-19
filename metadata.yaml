@@ -1,9 +1,9 @@
 name: astrbot_plugin_llm_blacklist
 display_name: 下头，拉黑了
-short_desc: LLM 自主拉黑与管理员黑名单管理，支持临时和永久拉黑。
-desc: 为 AstrBot 提供持久化黑名单、临时和永久拉黑、管理员查询和解封、平台与 Bot 隔离，以及旧版 llmtempban 黑名单迁移。
-help: 管理员可使用 /拉黑、/永久拉黑、/解除拉黑，目标支持 @用户或用户ID；使用 /黑名单 帮助 查看完整指令。LLM 工具 llm_blacklist_manage 支持临时拉黑、永久拉黑与解封。
-version: 1.2.0
+short_desc: 全局临时与永久拉黑，保存目标昵称，黑名单查询向所有人开放。
+desc: 为 AstrBot 提供全局临时与永久拉黑、目标昵称持久化、公开黑名单查询、管理员解封，以及平台实例与 Bot 隔离。
+help: 所有人（含被拉黑用户）可查看 ~黑名单，或使用 查询、列表、帮助。管理员可使用 ~拉黑、~永久拉黑、~解除拉黑；目标支持 @用户或用户ID，封禁全局生效并保存昵称。
+version: 1.3.0
 author: TenmaGabriel0721
 repo: https://github.com/TenmaGabriel0721/astrbot_plugin_llm_blacklist
 astrbot_version: ">=4.16,<5"

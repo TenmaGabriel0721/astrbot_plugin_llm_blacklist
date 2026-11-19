@@ -16,7 +16,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 
-from .blacklist import BanContext, BanRecord, BlacklistStore, scope_target
+from .blacklist import BanContext, BanRecord, BlacklistStore
 
 PLUGIN_NAME = "astrbot_plugin_llm_blacklist"
 BLOCK_HANDLER_PRIORITY = maxsize + 1
@@ -30,19 +30,22 @@ DIRECT_COMMAND_ACTIONS = {
     "llm解除拉黑": "解封",
 }
 HELP_TEXT = (
-    "下头，拉黑了 · 管理员指令\n"
+    "下头，拉黑了 · 指令\n"
+    "公开查询（被拉黑用户也可使用）：\n"
+    "/黑名单 列表 [页码]\n"
+    "/黑名单 查询 @用户或用户ID\n"
+    "/黑名单 帮助\n"
+    "管理员操作：\n"
     "/拉黑 @用户或用户ID [分钟] [原因]\n"
     "/永久拉黑 @用户或用户ID [原因]\n"
     "/解除拉黑 @用户或用户ID\n"
-    "/黑名单 列表 [页码]\n"
-    "/黑名单 查询 @用户或用户ID\n"
     "/黑名单 拉黑 @用户或用户ID [分钟] [原因]\n"
     "/黑名单 永久 @用户或用户ID [原因]\n"
     "/黑名单 解封 @用户或用户ID\n"
     "也可使用 /llm拉黑、/llm永久拉黑、/llm解除拉黑。\n"
     "查询、拉黑、永久和解封均支持真实 @用户；一次只操作一个目标。\n"
     "临时拉黑省略分钟时使用默认值；填写原因时需同时填写分钟。\n"
-    "拉黑范围由 ban_scope 配置决定；解封移除当前会话中对该用户生效的全部记录。"
+    "拉黑在当前平台实例、当前 Bot 的全部会话生效；解封移除对该用户生效的记录。"
 )
 
 
@@ -57,7 +60,7 @@ class LLMBlacklistPlugin(Star):
             config: Plugin configuration supplied by AstrBot.
 
         Raises:
-            ValueError: If a duration, scope, or switch is invalid.
+            ValueError: If a duration or switch is invalid.
         """
         super().__init__(context)
         self.config = config
@@ -70,9 +73,6 @@ class LLMBlacklistPlugin(Star):
         if self.max_duration <= 0 or self.default_duration <= 0:
             raise ValueError("Blacklist duration settings must be positive integers")
         self.default_duration = min(self.default_duration, self.max_duration)
-        self.ban_scope = config.get("ban_scope", "global")
-        if self.ban_scope not in {"global", "group", "session"}:
-            raise ValueError("ban_scope must be global, group, or session")
         self.strict_block_mode = config.get("strict_block_mode", True)
         self.allow_llm_permanent_ban = config.get("allow_llm_permanent_ban", True)
         if not isinstance(self.strict_block_mode, bool) or not isinstance(
@@ -188,6 +188,23 @@ class LLMBlacklistPlugin(Star):
         return tokens
 
     @staticmethod
+    def _is_public_blacklist_command(event: AstrMessageEvent) -> bool:
+        """Recognize the shared blacklist command's read-only operations.
+
+        Args:
+            event: Event whose wake prefix has been removed by AstrBot.
+
+        Returns:
+            Whether the message requests the public list, query or help.
+        """
+        tokens = event.get_message_str().strip().split()
+        return (
+            bool(tokens)
+            and tokens[0] in {"黑名单", "llm黑名单"}
+            and (len(tokens) == 1 or tokens[1] in {"列表", "查询", "帮助"})
+        )
+
+    @staticmethod
     def _identity(event: AstrMessageEvent) -> BanContext:
         """Build an identity that distinguishes configured platforms and bots.
 
@@ -236,10 +253,35 @@ class LLMBlacklistPlugin(Star):
             return
         # Despite its name, True disables AstrBot's default LLM route.
         event.should_call_llm(True)
+        handlers = event.get_extra("activated_handlers", []) or []
+        if self._is_public_blacklist_command(event):
+            public_handler = next(
+                (
+                    handler
+                    for handler in handlers
+                    if getattr(handler, "handler_full_name", None)
+                    == f"{__name__}_blacklist_command"
+                ),
+                None,
+            )
+            if public_handler is not None:
+                block_index = next(
+                    (
+                        index
+                        for index, handler in enumerate(handlers)
+                        if getattr(handler, "handler_full_name", None)
+                        == f"{__name__}_block_blacklisted_messages"
+                    ),
+                    -1,
+                )
+                # The SDK is iterating this list: retain the current hook and
+                # its already-processed prefix so the public command is next.
+                handlers[block_index + 1 :] = [public_handler]
+                event.set_extra("llm_blacklist_public_read", True)
+                return
         if self.strict_block_mode:
             event.stop_event()
         else:
-            handlers = event.get_extra("activated_handlers", []) or []
             handlers[:] = [
                 handler
                 for handler in handlers
@@ -283,7 +325,7 @@ class LLMBlacklistPlugin(Star):
             record: Blacklist record to display.
 
         Returns:
-            User ID, scope, expiry and reason in readable form.
+            User ID, saved nickname, scope, expiry and reason in readable form.
         """
         scope = {"global": "当前 Bot 全部会话", "group": "群聊", "session": "会话"}[
             record.scope
@@ -309,9 +351,72 @@ class LLMBlacklistPlugin(Star):
                 deadline = "远期（超出日期显示范围）"
             expiry = f"剩余 {minutes} 分 {seconds} 秒；到期 {deadline}"
         return (
-            f"用户：{record.user_id}\n范围：{scope}\n期限：{expiry}\n"
+            f"用户：{record.user_id}\n昵称：{record.nickname or '未记录'}\n"
+            f"范围：{scope}\n期限：{expiry}\n"
             f"原因：{record.reason or '未填写'}"
         )
+
+    async def _resolve_nickname(
+        self, event: AstrMessageEvent, user_id: str, nickname: str = ""
+    ) -> str:
+        """Find a target's display name without making it required for a ban.
+
+        Args:
+            event: Message with mention, sender and platform information.
+            user_id: Actual platform ID of the target.
+            nickname: Display name supplied by the target mention, if present.
+
+        Returns:
+            A single-line nickname snapshot, or an empty string if unavailable.
+        """
+        candidates = [nickname]
+        candidates.extend(
+            item.name
+            for item in event.get_messages()
+            if isinstance(item, At) and str(item.qq) == user_id
+        )
+        if user_id == str(event.get_sender_id()):
+            candidates.append(event.get_sender_name())
+        for name in candidates:
+            if isinstance(name, str) and name.strip():
+                return " ".join(name.split())[:128]
+        if event.get_platform_name() != "aiocqhttp" or not user_id.isdecimal():
+            return ""
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return ""
+        requests = []
+        group_id = str(event.get_group_id() or "")
+        if group_id.isdecimal():
+            requests.append(
+                {
+                    "action": "get_group_member_info",
+                    "group_id": int(group_id),
+                    "user_id": int(user_id),
+                    "no_cache": False,
+                }
+            )
+        requests.append(
+            {
+                "action": "get_stranger_info",
+                "user_id": int(user_id),
+                "no_cache": False,
+            }
+        )
+        for params in requests:
+            try:
+                info = await asyncio.wait_for(
+                    bot.call_action(**params, self_id=event.get_self_id()), timeout=3
+                )
+            except Exception:
+                logger.debug("[llm_blacklist] Nickname lookup unavailable")
+                continue
+            if isinstance(info, dict):
+                for field in ("card", "nickname", "nick"):
+                    name = info.get(field)
+                    if isinstance(name, str) and name.strip():
+                        return " ".join(name.split())[:128]
+        return ""
 
     async def _manage_blacklist(
         self,
@@ -321,6 +426,7 @@ class LLMBlacklistPlugin(Star):
         reason: str,
         permanent: bool,
         source: str,
+        nickname: str = "",
     ) -> str:
         """Apply command/tool policy and persist an explicit mutation.
 
@@ -331,6 +437,7 @@ class LLMBlacklistPlugin(Star):
             reason: Reason to store with the record.
             permanent: Whether the ban has no automatic expiry.
             source: Either admin or llm.
+            nickname: Target mention's display name; other sources are resolved.
 
         Returns:
             A user-facing result describing the committed state.
@@ -376,19 +483,20 @@ class LLMBlacklistPlugin(Star):
             if duration_minutes < 0:
                 duration_minutes = self.default_duration
             duration_minutes = min(duration_minutes, self.max_duration)
-            scope, scope_id = scope_target(identity, self.ban_scope)
+            nickname = await self._resolve_nickname(event, user_id, nickname)
             now = time.time()
             record = BanRecord(
                 user_id=user_id,
                 platform_id=identity.platform_id,
                 bot_id=identity.bot_id,
-                scope=scope,
-                scope_id=scope_id,
+                scope="global",
+                scope_id="",
                 reason=reason,
                 created_at=now,
                 expires_at=None if permanent else now + duration_minutes * 60,
                 operator=str(event.get_sender_id()),
                 source=source,
+                nickname=nickname,
             )
             saved = await asyncio.to_thread(self.store.ban, record)
             effective = self.store.get_active(user_id, identity) or saved
@@ -430,7 +538,6 @@ class LLMBlacklistPlugin(Star):
             event, user_id, duration_minutes, reason, permanent, "llm"
         )
 
-    @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
     @filter.command(
         "黑名单", alias={"llm黑名单", *DIRECT_COMMAND_ACTIONS}, priority=100
     )
@@ -440,23 +547,30 @@ class LLMBlacklistPlugin(Star):
         """查看黑名单，或通过拉黑、永久拉黑、解除拉黑指令管理用户。
 
         Args:
-            event: Administrator command event.
+            event: Public read or administrator management command event.
             action: 黑名单子操作；直接指令根据消息中的指令名称确定操作。
 
         Yields:
             One command response.
         """
-        if not event.is_admin():
-            yield event.plain_result("仅 AstrBot 管理员可以管理黑名单。")
-            return
-        event.should_call_llm(True)
         raw_tokens = event.get_message_str().strip().split()
         direct_action = (
             DIRECT_COMMAND_ACTIONS.get(raw_tokens[0]) if raw_tokens else None
         )
+        stop_after_reply = (
+            direct_action is not None
+            or self._active_ban(event) is not None
+            or event.get_extra("llm_blacklist_public_read", False)
+        )
+        event.should_call_llm(True)
+        if not self._is_public_blacklist_command(event) and not event.is_admin():
+            yield event.plain_result("仅 AstrBot 管理员可以管理黑名单。")
+            if stop_after_reply:
+                event.stop_event()
+            return
         if self.store is None:
             yield event.plain_result("黑名单尚未完成初始化。")
-            if direct_action is not None:
+            if stop_after_reply:
                 event.stop_event()
             return
         identity = self._identity(event)
@@ -474,6 +588,7 @@ class LLMBlacklistPlugin(Star):
                         )
                     action = tokens[1]
                 args = tokens[2:]
+            target_nickname = ""
             if action in {"查询", "拉黑", "永久", "解封"} and args:
                 target = args[0]
                 if isinstance(target, At):
@@ -482,6 +597,7 @@ class LLMBlacklistPlugin(Star):
                     if len(args) > 1 and isinstance(args[1], At):
                         raise ValueError("一次指令只能指定一个目标用户。")
                     args[0] = self._normalize_user_id(target.qq)
+                    target_nickname = target.name or ""
                 elif target.startswith(("@", "[CQ:at", "[At:", "<@")):
                     raise ValueError(
                         "请通过聊天客户端选择用户进行 @，或直接填写用户 ID。"
@@ -551,12 +667,17 @@ class LLMBlacklistPlugin(Star):
                     " ".join(reason_parts) or "管理员操作",
                     action == "永久",
                     "admin",
+                    nickname=target_nickname,
                 )
             else:
-                result = HELP_TEXT
+                prefixes = self.context.get_config(event.unified_msg_origin).get(
+                    "wake_prefix", ["/"]
+                )
+                prefix = next((item for item in prefixes if isinstance(item, str)), "/")
+                result = HELP_TEXT.replace("/", prefix)
         except ValueError as error:
             result = f"操作失败：{error}"
         yield event.plain_result(result)
-        if direct_action is not None:
+        if stop_after_reply:
             # Send the response before stopping competing command handlers.
             event.stop_event()

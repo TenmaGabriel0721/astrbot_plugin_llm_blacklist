@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 from astrbot_plugin_llm_blacklist import blacklist as store_module
@@ -82,6 +82,127 @@ def test_repeated_ban_never_shortens_or_downgrades(tmp_path, context, clock):
     downgraded = store.ban(record(context, expiry=1_900.0))
     assert downgraded.expires_at is None
     assert downgraded.created_at == original.created_at
+
+
+def test_old_schema_record_without_nickname_loads_without_rewriting(
+    tmp_path, context, clock
+):
+    path = tmp_path / "blacklist.json"
+    old_record = asdict(record(context, expiry=None))
+    old_record.pop("nickname")
+    path.write_text(json.dumps({"schema_version": 1, "records": [old_record]}))
+    original = path.read_bytes()
+
+    store = BlacklistStore(path)
+
+    loaded = store.get_active("user-a", context)
+    assert loaded.nickname == ""
+    assert loaded.expires_at is None
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("expiry", [2_000.0, None])
+def test_unicode_nickname_survives_storage_restart_and_listing(
+    tmp_path, context, clock, expiry
+):
+    path = tmp_path / "blacklist.json"
+    store = BlacklistStore(path)
+    store.ban(replace(record(context, expiry=expiry), nickname="小明 Alice 🐱"))
+
+    restarted = BlacklistStore(path)
+
+    assert restarted.get_active("user-a", context).nickname == "小明 Alice 🐱"
+    assert restarted.list_records(context)[0].nickname == "小明 Alice 🐱"
+    payload = json.loads(path.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["records"][0]["nickname"] == "小明 Alice 🐱"
+    assert payload["records"][0]["user_id"] == "user-a"
+
+
+@pytest.mark.parametrize("expiry", [4_000.0, None])
+def test_repeated_ban_updates_nickname_and_keeps_it_when_lookup_is_missing(
+    tmp_path, context, clock, expiry
+):
+    path = tmp_path / "blacklist.json"
+    store = BlacklistStore(path)
+    original = store.ban(replace(record(context, expiry=expiry), nickname="旧昵称"))
+    clock[0] += 10
+    renamed = store.ban(
+        replace(
+            record(context, expiry=1_800.0),
+            created_at=clock[0],
+            nickname="新昵称 🐱",
+        )
+    )
+    clock[0] += 10
+    without_lookup = store.ban(
+        replace(record(context, expiry=1_900.0), created_at=clock[0])
+    )
+
+    assert renamed.nickname == "新昵称 🐱"
+    assert without_lookup.nickname == "新昵称 🐱"
+    assert without_lookup.expires_at == original.expires_at
+    assert without_lookup.created_at == original.created_at
+    assert BlacklistStore(path).get_active("user-a", context).nickname == "新昵称 🐱"
+
+
+@pytest.mark.parametrize("known_first", [False, True])
+def test_duplicate_records_keep_strongest_expiry_and_available_nickname(
+    tmp_path, context, clock, known_first
+):
+    path = tmp_path / "blacklist.json"
+    strongest = asdict(record(context, expiry=None))
+    known = asdict(replace(record(context, expiry=1_800.0), nickname="可用昵称"))
+    records = [known, strongest] if known_first else [strongest, known]
+    path.write_text(json.dumps({"schema_version": 1, "records": records}))
+    original = path.read_bytes()
+
+    loaded = BlacklistStore(path).get_active("user-a", context)
+
+    assert loaded.expires_at is None
+    assert loaded.nickname == "可用昵称"
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("nickname", [None, 123, True, [], {}])
+def test_invalid_nickname_type_preserves_existing_database(
+    tmp_path, context, clock, nickname
+):
+    path = tmp_path / "blacklist.json"
+    payload = asdict(record(context, expiry=None))
+    payload["nickname"] = nickname
+    path.write_text(json.dumps({"schema_version": 1, "records": [payload]}))
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="nickname must be a string"):
+        BlacklistStore(path)
+
+    assert path.read_bytes() == original
+    with pytest.raises(ValueError, match="nickname must be a string"):
+        replace(record(context), nickname=nickname)
+
+
+def test_nickname_update_replace_failure_preserves_disk_and_memory(
+    tmp_path, context, clock, monkeypatch
+):
+    path = tmp_path / "blacklist.json"
+    store = BlacklistStore(path)
+    original_record = store.ban(
+        replace(record(context, expiry=None), nickname="已保存昵称")
+    )
+    original_file = path.read_bytes()
+
+    def fail_replace(*_):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(store_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        store.ban(replace(record(context), nickname="未保存昵称"))
+
+    assert store.get_active("user-a", context) == original_record
+    assert store.list_records(context)[0].nickname == "已保存昵称"
+    assert path.read_bytes() == original_file
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_scopes_remain_active_when_settings_change_and_unban_is_local(

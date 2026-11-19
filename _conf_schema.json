@@ -11,17 +11,10 @@
     "hint": "必须大于 0。适用于 LLM 和管理员创建的临时记录；不会缩短已有记录，也不限制永久拉黑。",
     "default": 1440
   },
-  "ban_scope": {
-    "description": "新建拉黑记录的范围",
-    "type": "string",
-    "hint": "global：当前平台实例、当前 Bot 的全部会话；group：当前群聊，私聊时按当前会话；session：当前会话来源。修改配置后，已有记录仍按原范围生效。",
-    "default": "global",
-    "options": ["global", "group", "session"]
-  },
   "strict_block_mode": {
     "description": "严格屏蔽后续消息处理器",
     "type": "bool",
-    "hint": "开启时终止被拉黑发送者的后续消息处理器和 LLM 请求。关闭时阻止标准指令和经过 AstrBot 钩子的 LLM 请求，普通监听器仍可处理消息。",
+    "hint": "开启时终止被拉黑发送者的后续消息处理器和 LLM 请求。关闭时阻止标准指令和经过 AstrBot 钩子的 LLM 请求，普通监听器仍可处理消息。黑名单列表、查询和帮助始终向被拉黑用户开放。",
     "default": true
   },
   "allow_llm_permanent_ban": {

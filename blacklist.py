@@ -65,6 +65,7 @@ class BanRecord:
     expires_at: float | None
     operator: str
     source: str
+    nickname: str = ""
 
     def __post_init__(self) -> None:
         """Reject invalid records before they can enter persistent storage.
@@ -81,6 +82,7 @@ class BanRecord:
             "reason",
             "operator",
             "source",
+            "nickname",
         ):
             if not isinstance(getattr(self, field), str):
                 raise ValueError(f"{field} must be a string")
@@ -285,7 +287,7 @@ class BlacklistStore:
             self.legacy_imported = True
 
     def _merge_loaded_record(self, record: BanRecord, now: float) -> None:
-        """Keep the strongest active record if a database repeats its identity.
+        """Keep the strongest active record and an available nickname.
 
         Args:
             record: Validated record being loaded.
@@ -301,7 +303,11 @@ class BlacklistStore:
                 and previous.expires_at >= record.expires_at
             )
         ):
+            if not previous.nickname and record.nickname:
+                self._records[record.key] = replace(previous, nickname=record.nickname)
             return
+        if previous is not None and not record.nickname:
+            record = replace(record, nickname=previous.nickname)
         self._records[record.key] = record
 
     def _write_records(self, records: dict[RecordKey, BanRecord]) -> None:
@@ -437,7 +443,10 @@ class BlacklistStore:
                 elif expires_at is not None:
                     expires_at = max(previous.expires_at, expires_at)
                 record = replace(
-                    record, created_at=previous.created_at, expires_at=expires_at
+                    record,
+                    created_at=previous.created_at,
+                    expires_at=expires_at,
+                    nickname=record.nickname or previous.nickname,
                 )
             updated[record.key] = record
             self._write_records(updated)
