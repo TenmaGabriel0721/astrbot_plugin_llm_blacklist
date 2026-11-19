@@ -325,17 +325,8 @@ class LLMBlacklistPlugin(Star):
             record: Blacklist record to display.
 
         Returns:
-            User ID, saved nickname, scope, expiry and reason in readable form.
+            User ID, saved nickname, expiry and reason in readable form.
         """
-        scope = {"global": "当前 Bot 全部会话", "group": "群聊", "session": "会话"}[
-            record.scope
-        ]
-        if not record.platform_id and not record.bot_id:
-            scope = "旧版" + scope
-            if record.scope == "global":
-                scope = "旧版全局（全部 Bot）"
-        if record.scope_id:
-            scope += f" {record.scope_id}"
         if record.expires_at is None:
             expiry = "永久，需手动解封"
         else:
@@ -352,7 +343,7 @@ class LLMBlacklistPlugin(Star):
             expiry = f"剩余 {minutes} 分 {seconds} 秒；到期 {deadline}"
         return (
             f"用户：{record.user_id}\n昵称：{record.nickname or '未记录'}\n"
-            f"范围：{scope}\n期限：{expiry}\n"
+            f"期限：{expiry}\n"
             f"原因：{record.reason or '未填写'}"
         )
 

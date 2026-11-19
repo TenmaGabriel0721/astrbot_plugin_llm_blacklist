@@ -346,7 +346,7 @@ async def test_existing_group_ban_can_be_read_and_unbanned_after_reload(
     query = FakeEvent(message="黑名单 查询 target")
     results = await invoke_blacklist_command(plugin, query, command_metadata)
     assert "用户：target" in results[0].get_plain_text()
-    assert "群聊 group-A" in results[0].get_plain_text()
+    assert plugin.store.get_active("target", identity(query)).scope == "group"
     unban = FakeEvent(user_id="owner", admin=True, message="解除拉黑 target")
     results = await invoke_blacklist_command(plugin, unban, command_metadata)
     assert "已解除用户 target" in results[0].get_plain_text()
